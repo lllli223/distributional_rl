@@ -238,7 +238,7 @@ class MarineNavTask(RLTask):
             self.theta = state['theta'] = torch.remainder(state['theta'] + abs_vel[..., 2] * dt, 2 * np.pi)
 
             # 4) 再更新相对速度与推力（船体动力学）
-            state = step_dynamics(state, actions, physics_params, dt, self.N, self.device)
+            state = step_dynamics(state, actions, physics_params, dt, self.device)
             self.vel_r = state['vel_r']
             self.left_thrust = state['left_thrust']
             self.right_thrust = state['right_thrust']
