@@ -1,0 +1,15 @@
+syntax: glob
+
+.DS_Store
+*.swp
+*.orig
+*.*~
+*.pyc
+vrx_ws/
+build/
+*.png
+training*
+test*
+experiment*
+vrx_experiment_results/
+vrx_visualize_episodes/

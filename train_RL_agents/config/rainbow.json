@@ -1,0 +1,24 @@
+{
+    "seed":[0],
+    "total_timesteps":6000000,
+    "eval_freq":60000,
+    "save_dir":"/home/rfal/Distributional_RL_Decision_and_Control/train_RL_agents/training_data",
+    "training_schedule":
+    {
+        "timesteps":[0,1000000,2000000,3000000,4000000,5000000],
+        "num_robots":[3,4,5,5,5,5],
+        "num_cores":[0,0,0,0,0,0],
+        "num_obstacles":[0,0,0,2,3,4],
+        "min_start_goal_dis":[30.0,35.0,40.0,40.0,40.0,40.0]
+    },
+    "eval_schedule":
+    {
+        "num_episodes": [10,10,10,10,10,10],
+        "num_robots":[3,4,5,5,5,5],
+        "num_cores":[0,0,0,0,0,0],
+        "num_obstacles":[0,0,0,2,3,4],
+        "min_start_goal_dis":[30.0,35.0,40.0,40.0,40.0,40.0]
+    },
+    "imitation_learning":false,
+    "agent_type":"Rainbow"
+}
