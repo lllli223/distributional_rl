@@ -12,14 +12,32 @@ class _RobotProxy:
     @property
     def deactivated(self):
         return bool(self._env.task.deactivated[self._e, self._r].item())
+    
+    @deactivated.setter
+    def deactivated(self, value):
+        self._env.task.deactivated[self._e, self._r] = torch.as_tensor(
+            value, dtype=torch.bool, device=self._env.task.deactivated.device
+        )
 
     @property
     def collision(self):
         return bool(self._env.task.collision[self._e, self._r].item())
+    
+    @collision.setter
+    def collision(self, value):
+        self._env.task.collision[self._e, self._r] = torch.as_tensor(
+            value, dtype=torch.bool, device=self._env.task.collision.device
+        )
 
     @property
     def reach_goal(self):
         return bool(self._env.task.reach_goal[self._e, self._r].item())
+    
+    @reach_goal.setter
+    def reach_goal(self, value):
+        self._env.task.reach_goal[self._e, self._r] = torch.as_tensor(
+            value, dtype=torch.bool, device=self._env.task.reach_goal.device
+        )
 
     @property
     def dt(self):
@@ -103,12 +121,16 @@ class IsaacMarineNavVecWrapper:
         rewards_tensor = self.task.calculate_metrics()
         rewards = rewards_tensor.reshape(-1).detach().cpu().numpy().tolist()
         
+        # 更新失活标志（必须在计算奖励后调用）
+        self.task.is_done()
+        
         # done 逐机器人：碰撞/到达 或 超时
         dones = []
-        timeout = bool((self.task.episode_step >= self.task.max_episode_len).item()) if hasattr(self.task.episode_step, 'item') else (self.task.episode_step >= self.task.max_episode_len)
+        timeout_env = self.task.episode_step >= self.task.max_episode_len
         for e in range(self.E):
+            env_timeout = bool(timeout_env[e].item()) if isinstance(timeout_env, torch.Tensor) else bool(timeout_env)
             for r in range(self.R):
-                dr = bool(self.task.collision[e, r].item()) or bool(self.task.reach_goal[e, r].item()) or timeout
+                dr = bool(self.task.collision[e, r].item()) or bool(self.task.reach_goal[e, r].item()) or env_timeout
                 dones.append(dr)
         
         infos = self._get_infos()
@@ -124,10 +146,12 @@ class IsaacMarineNavVecWrapper:
         E, R, K, _ = obj_obs.shape
         self_obs_flat = self_obs.reshape(E * R, -1).detach().cpu().numpy()
         obj_obs_flat = obj_obs.reshape(E * R, K, -1).detach().cpu().numpy()
+        obj_mask_flat = obj_mask.reshape(E * R, K).detach().cpu().numpy().astype(bool)
         # Trainer 的ReplayBuffer会自己补mask，这里保持原格式返回 (self, objects)
         observations = []
         for i in range(E * R):
-            observations.append((self_obs_flat[i], obj_obs_flat[i]))
+            valid_objects = obj_obs_flat[i][obj_mask_flat[i]]
+            observations.append((self_obs_flat[i], valid_objects))
         return observations
     
     def _get_infos(self) -> List[Dict]:

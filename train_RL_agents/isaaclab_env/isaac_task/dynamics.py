@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 
-def step_dynamics(state, action_lr, params, dt, N, device):
+def step_dynamics(state, action_lr, params, dt, device):
     """
     向量化船舶动力学计算（不更新位置与姿态）
     - 输入/输出位置与姿态由调用方管理；此函数仅更新相对速度与推力。
@@ -24,8 +24,8 @@ def step_dynamics(state, action_lr, params, dt, N, device):
     
     # 动作映射 [-1,1] -> 推力变化/秒
     thrust_change_scale = 1000.0
-    delta_left = action_lr[..., 0].clamp(-1.0, 1.0) * thrust_change_scale * dt * N
-    delta_right = action_lr[..., 1].clamp(-1.0, 1.0) * thrust_change_scale * dt * N
+    delta_left = action_lr[..., 0].clamp(-1.0, 1.0) * thrust_change_scale * dt
+    delta_right = action_lr[..., 1].clamp(-1.0, 1.0) * thrust_change_scale * dt
     
     # 更新推进器推力（与原环境一致的范围）
     new_left_thrust = torch.clamp(left_thrust + delta_left, -500.0, 1000.0)
