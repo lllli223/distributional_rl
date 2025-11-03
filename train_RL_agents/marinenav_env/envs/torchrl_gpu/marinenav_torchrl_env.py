@@ -83,21 +83,34 @@ class MarineNavTorchRLEnv(EnvBase):
     
     def _step(self, tensordict):
         actions = tensordict["action"].cpu().numpy()
+        if actions.ndim == 1:
+            actions = np.expand_dims(actions, axis=0)
         
-        action_list = []
-        for i in range(self.num_robots):
-            if i < len(self._env.robots) and not self._env.robots[i].deactivated:
-                action_list.append(actions[i])
-            else:
-                action_list.append(None)
+        actual_num_robots = len(self._env.robots)
+        if actual_num_robots > actions.shape[0]:
+            raise ValueError(
+                f"Received {actions.shape[0]} actions but environment has {actual_num_robots} robots"
+            )
+        
+        action_list = [actions[i] for i in range(actual_num_robots)]
         
         is_continuous_action = True
         next_states, rewards, dones, infos = self._env.step(action_list, is_continuous_action)
         
         obs_td = self._format_observation(next_states)
         
-        rewards_tensor = torch.tensor(rewards, dtype=torch.float32, device=self.device).view(self.num_robots, 1)
-        dones_tensor = torch.tensor(dones, dtype=torch.bool, device=self.device).view(self.num_robots, 1)
+        max_slots = self.num_robots
+        padded_rewards = np.zeros(max_slots, dtype=np.float32)
+        padded_dones = np.zeros(max_slots, dtype=bool)
+        
+        rewards_array = np.array(rewards, dtype=np.float32).reshape(-1)
+        dones_array = np.array(dones, dtype=bool).reshape(-1)
+        limit = min(max_slots, rewards_array.shape[0])
+        padded_rewards[:limit] = rewards_array[:limit]
+        padded_dones[:limit] = dones_array[:limit]
+        
+        rewards_tensor = torch.tensor(padded_rewards, dtype=torch.float32, device=self.device).unsqueeze(-1)
+        dones_tensor = torch.tensor(padded_dones, dtype=torch.bool, device=self.device).unsqueeze(-1)
         
         obs_td["reward"] = rewards_tensor
         obs_td["done"] = dones_tensor
@@ -105,32 +118,30 @@ class MarineNavTorchRLEnv(EnvBase):
         return obs_td
     
     def _format_observation(self, states):
-        self_states = []
-        objects_states = []
-        objects_masks = []
+        max_slots = self.num_robots
+        actual_states = len(states)
+        actual_robots = len(self._env.robots)
         
-        for i, state in enumerate(states):
-            if state is None or (i < len(self._env.robots) and self._env.robots[i].deactivated):
-                self_states.append(np.zeros(self.self_dim))
-                objects_states.append(np.zeros((self.max_obj_num, self.obj_dim)))
-                objects_masks.append(np.zeros(self.max_obj_num))
-            else:
-                self_state, obj_list = state
-                self_states.append(np.array(self_state))
-                
-                obj_arr = np.zeros((self.max_obj_num, self.obj_dim))
-                mask = np.zeros(self.max_obj_num)
-                
-                for j, obj in enumerate(obj_list[:self.max_obj_num]):
-                    obj_arr[j] = np.array(obj)
-                    mask[j] = 1.0
-                
-                objects_states.append(obj_arr)
-                objects_masks.append(mask)
+        self_states = np.zeros((max_slots, self.self_dim), dtype=np.float32)
+        objects_states = np.zeros((max_slots, self.max_obj_num, self.obj_dim), dtype=np.float32)
+        objects_masks = np.zeros((max_slots, self.max_obj_num), dtype=np.float32)
         
-        self_state_tensor = torch.tensor(np.array(self_states), dtype=torch.float32, device=self.device)
-        objects_state_tensor = torch.tensor(np.array(objects_states), dtype=torch.float32, device=self.device)
-        objects_mask_tensor = torch.tensor(np.array(objects_masks), dtype=torch.float32, device=self.device)
+        limit = min(max_slots, actual_states)
+        for i in range(limit):
+            state = states[i]
+            if state is None:
+                continue
+            if i < actual_robots and self._env.robots[i].deactivated:
+                continue
+            self_state, obj_list = state
+            self_states[i] = np.asarray(self_state, dtype=np.float32)
+            for j, obj in enumerate(obj_list[: self.max_obj_num]):
+                objects_states[i, j] = np.asarray(obj, dtype=np.float32)
+                objects_masks[i, j] = 1.0
+        
+        self_state_tensor = torch.tensor(self_states, dtype=torch.float32, device=self.device)
+        objects_state_tensor = torch.tensor(objects_states, dtype=torch.float32, device=self.device)
+        objects_mask_tensor = torch.tensor(objects_masks, dtype=torch.float32, device=self.device)
         
         return TensorDict({
             "self_state": self_state_tensor,
