@@ -102,31 +102,41 @@ class TorchRLTrainer:
             
             td_next = self.train_env.step(td)
             
-            rewards = td_next["reward"].cpu().numpy().flatten()
-            dones = td_next["done"].cpu().numpy().flatten()
+            if self.rl_agent.training:
+                rewards_cpu = td_next["reward"].cpu().numpy().flatten()
+                dones_cpu = td_next["done"].cpu().numpy().flatten()
+                
+                self_state_cpu = td["self_state"].cpu().numpy()
+                obj_state_cpu = td["objects_state"].cpu().numpy()
+                obj_mask_cpu = td["objects_mask"].cpu().numpy()
+                
+                next_self_state_cpu = td_next["self_state"].cpu().numpy()
+                next_obj_state_cpu = td_next["objects_state"].cpu().numpy()
+                next_obj_mask_cpu = td_next["objects_mask"].cpu().numpy()
+                
+                actions_cpu = td["action"].cpu().numpy()
+            else:
+                rewards_cpu = td_next["reward"].cpu().numpy().flatten()
+                dones_cpu = td_next["done"].cpu().numpy().flatten()
             
             for i, rob in enumerate(self.train_env.robots):
                 if rob.deactivated:
                     continue
                 
-                ep_rewards[i] += self.rl_agent.GAMMA ** ep_length * rewards[i]
+                ep_rewards[i] += self.rl_agent.GAMMA ** ep_length * rewards_cpu[i]
                 
                 if self.rl_agent.training:
-                    self_state = td["self_state"][i].cpu().numpy().tolist()
-                    obj_state = td["objects_state"][i].cpu().numpy()
-                    obj_mask = td["objects_mask"][i].cpu().numpy()
-                    obj_list = [obj_state[j].tolist() for j in range(len(obj_state)) if obj_mask[j] > 0.5]
-                    state = (self_state, obj_list)
+                    valid_mask = obj_mask_cpu[i] > 0.5
+                    obj_list = obj_state_cpu[i][valid_mask].tolist()
+                    state = (self_state_cpu[i].tolist(), obj_list)
                     
-                    next_self_state = td_next["self_state"][i].cpu().numpy().tolist()
-                    next_obj_state = td_next["objects_state"][i].cpu().numpy()
-                    next_obj_mask = td_next["objects_mask"][i].cpu().numpy()
-                    next_obj_list = [next_obj_state[j].tolist() for j in range(len(next_obj_state)) if next_obj_mask[j] > 0.5]
-                    next_state = (next_self_state, next_obj_list)
+                    next_valid_mask = next_obj_mask_cpu[i] > 0.5
+                    next_obj_list = next_obj_state_cpu[i][next_valid_mask].tolist()
+                    next_state = (next_self_state_cpu[i].tolist(), next_obj_list)
                     
-                    action = td["action"][i].cpu().numpy()
-                    reward = rewards[i]
-                    done = dones[i]
+                    action = actions_cpu[i]
+                    reward = rewards_cpu[i]
+                    done = dones_cpu[i]
                     
                     if self.rl_agent.agent_type == "Rainbow":
                         self.rl_agent.memory.append(state, action, reward, done)
