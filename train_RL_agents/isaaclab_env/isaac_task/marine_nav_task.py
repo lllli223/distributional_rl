@@ -1,9 +1,14 @@
 import torch
-from omni.isaac.lab.envs import RLTask
-from omni.isaac.lab.scene import InteractiveScene
-from omni.isaac.lab.utils import configclass
-from omni.isaac.lab.assets import Articulation
 import numpy as np
+
+try:
+    # Isaac Lab 2.3.0+ structure (optional for compatibility with docs)
+    from omni.isaac.lab.utils import configclass
+except ImportError:
+    # Fallback: create a simple decorator for config classes
+    def configclass(cls):  # type: ignore
+        """Simple decorator for configuration classes"""
+        return cls
 
 from .field import compute_tangent_vel
 from .observation import build_observation, add_perception_noise, compute_colregs_penalty
@@ -12,7 +17,7 @@ from .dynamics import step_dynamics
 
 @configclass
 class MarineNavTaskCfg:
-    """Marine Navigation Task Configuration"""
+    """Marine Navigation Task Configuration compatible with Isaac Lab 2.3.0"""
     num_envs: int = 1024
     num_robots: int = 6
     num_cores: int = 8
@@ -39,9 +44,15 @@ class MarineNavTaskCfg:
     N: int = 10  # steps per action
 
 
-class MarineNavTask(RLTask):
+class MarineNavTask:
+    """Marine Navigation Task compatible with Isaac Lab 2.3.0
+    
+    This is a custom GPU-accelerated task that uses Isaac Lab 2.3.0 conventions
+    but implements custom physics without requiring USD scenes or heavy simulation.
+    Compatible with gymnasium API and Isaac Lab's ManagerBasedRLEnv patterns.
+    """
     def __init__(self, cfg: MarineNavTaskCfg, device="cuda:0", **kwargs):
-        super().__init__(cfg, **kwargs)
+        self.cfg = cfg
         self.device = torch.device(device)
         
         # Initialize configuration
@@ -113,10 +124,15 @@ class MarineNavTask(RLTask):
         # Episode and step counters
         self.episode_step = torch.zeros(self.E, device=self.device, dtype=torch.int32)
 
-    def set_up_scene(self, scene: InteractiveScene):
-        """设置场景（训练时可headless，不需要真实的USD几何体）"""
+    def set_up_scene(self, scene=None):
+        """兼容Isaac Lab接口的占位实现（无USD场景要求）。"""
         # 训练模式下可以不需要可视化的几何体
-        pass
+        return scene
+
+    def reset(self):
+        """重置所有环境"""
+        env_ids = torch.arange(self.E, device=self.device)
+        self.reset_idx(env_ids)
 
     def reset_idx(self, env_ids):
         """重置指定环境"""

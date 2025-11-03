@@ -1,7 +1,7 @@
 import numpy as np
 import scipy.spatial
 import marinenav_env.envs.utils.robot as robot
-import gym
+import gymnasium as gym
 import json
 import copy
 
