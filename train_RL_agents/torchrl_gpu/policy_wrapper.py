@@ -1,4 +1,3 @@
-import numpy as np
 import torch
 import torch.nn as nn
 
@@ -7,6 +6,7 @@ class PolicyWrapper(nn.Module):
     """
     Wraps existing Agent for TorchRL compatibility.
     Converts TensorDict observations to the format expected by existing agents.
+    Optimized for batched GPU inference without CPU transfers.
     """
 
     def __init__(self, agent, max_obj_num=5, epsilon=0.0):
@@ -16,7 +16,15 @@ class PolicyWrapper(nn.Module):
         self.epsilon = epsilon
         self.training_mode = True
         self.is_continuous = self.agent.agent_type in ("AC-IQN", "DDPG", "SAC")
-        self.action_dim = 2 if self.is_continuous else 1
+        if self.is_continuous:
+            self.action_dim = len(self.agent.value_ranges_of_action)
+            value_ranges = torch.tensor(self.agent.value_ranges_of_action, dtype=torch.float32)
+            self.register_buffer("action_low", value_ranges[:, 0])
+            self.register_buffer("action_high", value_ranges[:, 1])
+        else:
+            self.action_dim = 1
+            self.register_buffer("action_low", torch.zeros(0, dtype=torch.float32))
+            self.register_buffer("action_high", torch.zeros(0, dtype=torch.float32))
 
     def forward(self, tensordict):
         self_state = tensordict["self_state"]
@@ -26,59 +34,91 @@ class PolicyWrapper(nn.Module):
         batch_size = self_state.shape[0]
         device = self_state.device
 
-        actions = []
-        for i in range(batch_size):
-            self_obs = self_state[i].cpu().numpy()
-            obj_obs = objects_state[i].cpu().numpy()
-            mask = objects_mask[i].cpu().numpy()
-
-            obj_list = [obj_obs[j].tolist() for j in range(self.max_obj_num) if mask[j] > 0.5]
-
-            state = (self_obs.tolist(), obj_list)
-
-            if self.training_mode:
-                if self.agent.agent_type == "AC-IQN":
-                    action = self.agent.act_ac_iqn(state, self.epsilon, use_eval=False)
-                elif self.agent.agent_type == "IQN":
-                    action, _, _ = self.agent.act_iqn(state, self.epsilon, use_eval=False)
-                elif self.agent.agent_type == "DDPG":
-                    action = self.agent.act_ddpg(state, self.epsilon, use_eval=False)
-                elif self.agent.agent_type == "DQN":
-                    action = self.agent.act_dqn(state, self.epsilon, use_eval=False)
-                elif self.agent.agent_type == "SAC":
-                    action = self.agent.act_sac(state, self.epsilon, use_eval=False)
-                elif self.agent.agent_type == "Rainbow":
-                    action = self.agent.act_rainbow(state, self.epsilon, use_eval=False)
-                else:
-                    raise RuntimeError(f"Agent type {self.agent.agent_type} not implemented!")
-            else:
-                if self.agent.agent_type == "AC-IQN":
-                    action = self.agent.act_ac_iqn(state)
-                elif self.agent.agent_type == "IQN":
-                    action, _, _ = self.agent.act_iqn(state)
-                elif self.agent.agent_type == "DDPG":
-                    action = self.agent.act_ddpg(state)
-                elif self.agent.agent_type == "DQN":
-                    action = self.agent.act_dqn(state)
-                elif self.agent.agent_type == "SAC":
-                    action = self.agent.act_sac(state)
-                elif self.agent.agent_type == "Rainbow":
-                    action = self.agent.act_rainbow(state)
-                else:
-                    raise RuntimeError(f"Agent type {self.agent.agent_type} not implemented!")
-
+        with torch.no_grad():
             if self.is_continuous:
-                action_vec = np.asarray(action, dtype=np.float32).reshape(-1)
+                actions = self._forward_continuous_batched(
+                    self_state, objects_state, objects_mask, batch_size, device
+                )
             else:
-                action_vec = np.asarray([action], dtype=np.float32)
+                actions = self._forward_discrete_batched(
+                    self_state, objects_state, objects_mask, batch_size, device
+                )
 
-            padded_action = np.zeros(self.action_dim, dtype=np.float32)
-            padded_action[: min(len(action_vec), self.action_dim)] = action_vec[: self.action_dim]
-            actions.append(padded_action)
+        return tensordict.set("action", actions)
 
-        action_tensor = torch.tensor(actions, dtype=torch.float32, device=device)
+    def _forward_continuous_batched(self, self_state, objects_state, objects_mask, batch_size, device):
+        state_tuple = (self_state, objects_state, objects_mask)
+        
+        if self.agent.agent_type == "AC-IQN":
+            if self.training_mode:
+                self.agent.policy_local.actor.train()
+            else:
+                self.agent.policy_local.actor.eval()
+            actions = self.agent.policy_local.actor(state_tuple)
+        elif self.agent.agent_type == "DDPG":
+            if self.training_mode:
+                self.agent.policy_local.actor.train()
+            else:
+                self.agent.policy_local.actor.eval()
+            actions = self.agent.policy_local.actor(state_tuple)
+        elif self.agent.agent_type == "SAC":
+            if self.training_mode:
+                self.agent.policy_local.actor.train()
+            else:
+                self.agent.policy_local.actor.eval()
+            actions, _ = self.agent.policy_local.actor(state_tuple)
+        else:
+            raise RuntimeError(f"Agent type {self.agent.agent_type} not implemented!")
 
-        return tensordict.set("action", action_tensor)
+        actions = actions.to(device=device, dtype=torch.float32)
+
+        if self.training_mode and self.epsilon > 0:
+            explore_mask = torch.rand(batch_size, device=device) < self.epsilon
+            if explore_mask.any():
+                low = self.action_low.to(device).unsqueeze(0)
+                high = self.action_high.to(device).unsqueeze(0)
+                random_actions = low + (high - low) * torch.rand(batch_size, self.action_dim, device=device)
+                actions = torch.where(explore_mask.unsqueeze(1), random_actions, actions)
+
+        return actions
+
+    def _forward_discrete_batched(self, self_state, objects_state, objects_mask, batch_size, device):
+        state_tuple = (self_state, objects_state, objects_mask)
+        
+        if self.agent.agent_type == "IQN":
+            if self.training_mode:
+                self.agent.policy_local.train()
+            else:
+                self.agent.policy_local.eval()
+            quantiles, _ = self.agent.policy_local(state_tuple, self.agent.policy_local.K, cvar=1.0)
+            action_values = quantiles.mean(dim=1)
+        elif self.agent.agent_type == "DQN":
+            if self.training_mode:
+                self.agent.policy_local.train()
+            else:
+                self.agent.policy_local.eval()
+            action_values = self.agent.policy_local(state_tuple)
+        elif self.agent.agent_type == "Rainbow":
+            if self.training_mode:
+                self.agent.policy_local.train()
+            else:
+                self.agent.policy_local.eval()
+            action_value_probs = self.agent.policy_local(state_tuple)
+            action_values = (action_value_probs * self.agent.support.unsqueeze(0).unsqueeze(0)).sum(2)
+        else:
+            raise RuntimeError(f"Agent type {self.agent.agent_type} not implemented!")
+
+        if self.training_mode and self.epsilon > 0:
+            explore_mask = torch.rand(batch_size, device=device) < self.epsilon
+            greedy_actions = action_values.argmax(dim=1)
+            random_actions = torch.randint(0, self.agent.action_size, (batch_size,), device=device)
+            action_indices = torch.where(explore_mask, random_actions, greedy_actions)
+        else:
+            action_indices = action_values.argmax(dim=1)
+
+        actions = action_indices.unsqueeze(1).float()
+        
+        return actions
 
     def set_epsilon(self, epsilon):
         self.epsilon = epsilon
