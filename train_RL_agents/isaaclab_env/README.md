@@ -1,6 +1,13 @@
 # GPU 并行化海洋导航环境
 
-本项目已将原有的marinenav_env环境升级为基于Isaac Lab的GPU并行化环境，实现了显著的训练性能提升。
+本项目已将原有的marinenav_env环境升级为基于Isaac Lab 2.3.0的GPU并行化环境，实现了显著的训练性能提升。
+
+## 版本信息
+
+- **Isaac Lab**: release/2.3.0
+- **Isaac Sim**: release/2.3.0
+- **Gymnasium**: 最新版本（取代gym）
+- **PyTorch**: CUDA支持
 
 ## 性能提升
 
@@ -13,12 +20,18 @@
 - **船舶动力学**: 用广播矩阵运算替代逐机器人计算
 - **感知观测**: 批量处理障碍物检测和COLREGs规则
 
-### 2. Isaac Lab集成
-- 使用Isaac Lab的RLTask框架
+### 2. Isaac Lab 2.3.0 集成
+- 兼容Isaac Lab 2.3.0 API结构
+- 使用可选的Isaac Lab工具类（configclass等）
 - 支持GPU VecEnv调度
 - 保持与原有训练代码的兼容性
 
-### 3. 最小侵入性改造
+### 3. Gymnasium 迁移
+- 全面从gym迁移到gymnasium
+- 兼容最新的强化学习生态系统
+- 保持API向后兼容
+
+### 4. 最小侵入性改造
 - 提供包装器适配原有接口
 - 智能体和训练器无需修改
 - 支持渐进式迁移
