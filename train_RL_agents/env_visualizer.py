@@ -7,7 +7,6 @@ import matplotlib.animation as animation
 from matplotlib.patches import Rectangle, Polygon
 from matplotlib.transforms import Affine2D
 import copy
-import scipy.spatial
 import gymnasium as gym
 import json
 import os
