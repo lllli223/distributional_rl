@@ -2,6 +2,10 @@ import random
 from collections import deque
 import torch
 import copy
+from tensordict import TensorDict
+from torchrl.data import ReplayBuffer as TorchRLReplayBuffer
+from torchrl.data import TensorStorage, RandomSampler
+
 
 class ReplayBuffer:
     """Fixed-size buffer to store experience tuples."""
@@ -23,9 +27,11 @@ class ReplayBuffer:
         """Add a new experience to memory."""
         self.memory.append(item)
     
-    def sample(self):
+    def sample(self, batch_size=None):
         """Randomly sample a batch of experiences from memory."""
-        samples = random.sample(self.memory, k=self.batch_size)
+        if batch_size is None:
+            batch_size = self.batch_size
+        samples = random.sample(self.memory, k=batch_size)
         states = []
         actions = []
         rewards = []
@@ -69,5 +75,62 @@ class ReplayBuffer:
         return (self_state_batch,padded_object_states_batch,padded_object_states_batch_mask)
 
 
-    
+class TensorDictReplayBuffer:
+    """
+    GPU-resident replay buffer built on top of torchrl.data.ReplayBuffer with TensorStorage.
+    Stores and returns TensorDict batches living on CUDA without any CPU transfers.
 
+    Schema for each transition (batch dimension = B):
+      - self_state: float32 [B, 7]
+      - objects_state: float32 [B, max_obj_num, 5]
+      - objects_mask: float32 [B, max_obj_num]
+      - action: float32 [B, act_dim] (continuous) or int64 [B, 1] (discrete)
+      - reward: float32 [B, 1]
+      - done: bool [B, 1]
+      - next/self_state, next/objects_state, next/objects_mask
+    """
+
+    def __init__(self, capacity, device="cuda"):
+        self.device = torch.device(device)
+        self._rb = TorchRLReplayBuffer(storage=TensorStorage(max_size=capacity, device=self.device),
+                                       sampler=RandomSampler())
+
+    def add(self, td_or_batch_td: TensorDict):
+        """
+        Add a batch of transitions in a single call. The input must be a TensorDict with batch size [B].
+        """
+        if not isinstance(td_or_batch_td, TensorDict):
+            raise TypeError("Expected a TensorDict with a batch of transitions.")
+        # Ensure it lives on the correct device
+        td_or_batch_td = td_or_batch_td.to(self.device)
+        # Extend supports batched TensorDict to add B items at once
+        self._rb.extend(td_or_batch_td)
+
+    def sample(self, batch_size):
+        """Uniformly sample a batch and return a tuple compatible with agents' train_* methods."""
+        td = self._rb.sample(batch_size)
+        # Ensure device is correct
+        td = td.to(self.device)
+
+        # Build tuples to keep backward compatibility with Agent state_to_tensor()
+        states = (
+            td.get("self_state"),
+            td.get("objects_state"),
+            td.get("objects_mask"),
+        )
+        next_states = (
+            td.get(("next", "self_state")),
+            td.get(("next", "objects_state")),
+            td.get(("next", "objects_mask")),
+        )
+        actions = td.get("action")
+        rewards = td.get("reward")
+        dones = td.get("done")
+        return states, actions, rewards, next_states, dones
+
+    def size(self):
+        try:
+            return len(self._rb._storage)
+        except Exception:
+            # Fallback to ReplayBuffer length which should proxy to storage
+            return len(self._rb)
