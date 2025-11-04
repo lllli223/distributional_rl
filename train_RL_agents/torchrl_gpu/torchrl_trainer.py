@@ -272,7 +272,7 @@ class TorchRLTrainer:
             print(f"Evaluating episode {idx}")
             td = self.eval_env.reset_with_eval_config(config)
             
-            rob_num = len(self.eval_env.robots)
+            rob_num = td["self_state"].shape[1]
             
             relations = [[] for _ in range(rob_num)]
             rewards = [0.0] * rob_num
@@ -282,18 +282,19 @@ class TorchRLTrainer:
             length = 0
             
             while not end_episode:
-                # Flatten (E=1,R,...) -> (R,...)
+                # Flatten (E=1,R,...) -> (R,...) - get actual R from tensor shape
+                actual_rob_num = td["self_state"].shape[1]
                 obs_flat = TensorDict(
                     {
                         "self_state": td["self_state"].squeeze(0),
                         "objects_state": td["objects_state"].squeeze(0),
                         "objects_mask": td["objects_mask"].squeeze(0),
                     },
-                    batch_size=[rob_num],
+                    batch_size=[actual_rob_num],
                     device=self.device,
                 )
                 td_actions = self.policy_wrapper(obs_flat)
-                actions = td_actions["action"].view(1, rob_num, -1)
+                actions = td_actions["action"].view(1, actual_rob_num, -1)
                 td_next = self.eval_env._step(TensorDict({"action": actions}, batch_size=[1], device=self.device))
                 
                 reward_vals = td_next["reward"].cpu().numpy().flatten()
