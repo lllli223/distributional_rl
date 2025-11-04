@@ -1,5 +1,4 @@
 import numpy as np
-import scipy.spatial
 import marinenav_env.envs.utils.robot as robot
 import gymnasium as gym
 import json
@@ -144,9 +143,11 @@ class MarineNavEnv3(gym.Env):
                 c = np.array([[core.x,core.y]])
                 centers = np.vstack((centers,c))
         
-        # KDTree storing vortex core center positions
+        # Store vortex core center positions as an array (no SciPy KDTree)
         if centers is not None:
-            self.core_centers = scipy.spatial.KDTree(centers)
+            self.core_centers = centers
+        else:
+            self.core_centers = None
 
         ##### generate static obstacles with random position and size
         if num_obs > 0:
@@ -460,36 +461,35 @@ class MarineNavEnv3(gym.Env):
         if len(self.cores) == 0:
             return np.zeros(3)
         
-        # sort the vortices according to their distance to the query point
-        d, idx = self.core_centers.query(np.array([x,y]),k=len(self.cores))
-        if isinstance(idx,np.int64):
-            idx = [idx]
+        # Vectorized computation over all cores (no SciPy KDTree)
+        if self.core_centers is None:
+            return np.zeros(3)
+        centers = self.core_centers  # shape: [C, 2]
+        dx = centers[:, 0] - x
+        dy = centers[:, 1] - y
+        d = np.sqrt(dx * dx + dy * dy)
+        # Avoid division by zero at the exact core center
+        d_safe = np.where(d == 0.0, 1e-8, d)
+        # Unit radial vectors pointing from query to core
+        radial_x = dx / d_safe
+        radial_y = dy / d_safe
 
-        v_radial_set = []
-        v_velocity = np.zeros((2,1))
-        for i in list(idx): 
-            core = self.cores[i]
-            v_radial = np.matrix([[core.x-x],[core.y-y]])
+        # Tangent direction depends on clockwise flag
+        clockwise = np.array([1 if c.clockwise else 0 for c in self.cores], dtype=np.int32)
+        # For clockwise: v_tangent = [ -radial_y,  radial_x ]
+        # For counter-clockwise: v_tangent = [ radial_y, -radial_x ]
+        tan_x = np.where(clockwise == 1, -radial_y, radial_y)
+        tan_y = np.where(clockwise == 1,  radial_x, -radial_x)
 
-            for v in v_radial_set:
-                project = np.transpose(v) * v_radial
-                if project[0,0] > 0:
-                    # if the core is in the outter area of a checked core (wrt the query position),
-                    # assume that it has no influence the velocity of the query position
-                    continue
-            
-            v_radial_set.append(v_radial)
-            dis = np.linalg.norm(v_radial)
-            v_radial /= dis
-            if core.clockwise:
-                rotation = np.matrix([[0., -1.],[1., 0]])
-            else:
-                rotation = np.matrix([[0., 1.],[-1., 0]])
-            v_tangent = rotation * v_radial
-            speed = self.compute_speed(core.Gamma,dis)
-            v_velocity += v_tangent * speed
-        
-        return np.array([v_velocity[0,0], v_velocity[1,0], 0.0])
+        # Piecewise current speed
+        Gamma = np.array([c.Gamma for c in self.cores], dtype=float)
+        speed_inner = Gamma / (2 * np.pi * self.r * self.r) * d
+        speed_outer = Gamma / (2 * np.pi * d_safe)
+        speed = np.where(d <= self.r, speed_inner, speed_outer)
+
+        vx = np.sum(tan_x * speed)
+        vy = np.sum(tan_y * speed)
+        return np.array([vx, vy, 0.0])
 
     def get_velocity_test(self,x:float, y:float):
         v = np.ones(2)
@@ -539,7 +539,9 @@ class MarineNavEnv3(gym.Env):
                 centers = np.vstack((centers,c))
         
         if centers is not None:
-            self.core_centers = scipy.spatial.KDTree(centers)
+            self.core_centers = centers
+        else:
+            self.core_centers = None
 
         # load obstacles
         self.obstacles.clear()
