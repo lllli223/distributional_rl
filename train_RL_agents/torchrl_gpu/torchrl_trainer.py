@@ -3,7 +3,9 @@ import numpy as np
 import os
 import json
 import copy
+from tensordict import TensorDict
 from torchrl_gpu.policy_wrapper import PolicyWrapper
+from policy.replay_buffer import TensorDictReplayBuffer
 
 
 class TorchRLTrainer:
@@ -50,6 +52,10 @@ class TorchRLTrainer:
             assert self.il_agent is not None, "Imitation Learning agent not given!"
         
         self.policy_wrapper = PolicyWrapper(self.rl_agent, max_obj_num=5, epsilon=self.initial_eps)
+        
+        # Initialize GPU replay buffer for non-Rainbow agents
+        if self.rl_agent.training and self.rl_agent.agent_type != "Rainbow":
+            self.rl_agent.memory = TensorDictReplayBuffer(capacity=self.rl_agent.BUFFER_SIZE, device=self.device)
         
         self.current_timestep = 0
         self.learning_timestep = 0
@@ -102,50 +108,49 @@ class TorchRLTrainer:
             
             td_next = self.train_env.step(td)
             
-            if self.rl_agent.training:
-                rewards_cpu = td_next["reward"].cpu().numpy().flatten()
-                dones_cpu = td_next["done"].cpu().numpy().flatten()
-                
-                self_state_cpu = td["self_state"].cpu().numpy()
-                obj_state_cpu = td["objects_state"].cpu().numpy()
-                obj_mask_cpu = td["objects_mask"].cpu().numpy()
-                
-                next_self_state_cpu = td_next["self_state"].cpu().numpy()
-                next_obj_state_cpu = td_next["objects_state"].cpu().numpy()
-                next_obj_mask_cpu = td_next["objects_mask"].cpu().numpy()
-                
-                actions_cpu = td["action"].cpu().numpy()
-            else:
-                rewards_cpu = td_next["reward"].cpu().numpy().flatten()
-                dones_cpu = td_next["done"].cpu().numpy().flatten()
+            # GPU-only bookkeeping and replay writing
+            rewards_tensor = td_next["reward"].squeeze(-1)  # [B]
+            # dones are available if needed: dones_tensor = td_next["done"].squeeze(-1)
             
             for i, rob in enumerate(self.train_env.robots):
                 if rob.deactivated:
                     continue
-                
-                ep_rewards[i] += self.rl_agent.GAMMA ** ep_length * rewards_cpu[i]
-                
-                if self.rl_agent.training:
-                    valid_mask = obj_mask_cpu[i] > 0.5
-                    obj_list = obj_state_cpu[i][valid_mask].tolist()
-                    state = (self_state_cpu[i].tolist(), obj_list)
-                    
-                    next_valid_mask = next_obj_mask_cpu[i] > 0.5
-                    next_obj_list = next_obj_state_cpu[i][next_valid_mask].tolist()
-                    next_state = (next_self_state_cpu[i].tolist(), next_obj_list)
-                    
-                    action = actions_cpu[i]
-                    reward = rewards_cpu[i]
-                    done = dones_cpu[i]
-                    
-                    if self.rl_agent.agent_type == "Rainbow":
-                        self.rl_agent.memory.append(state, action, reward, done)
-                    else:
-                        self.rl_agent.memory.add((state, action, reward, next_state, done))
-                
+                ep_rewards[i] += (self.rl_agent.GAMMA ** ep_length) * rewards_tensor[i].item()
                 if rob.collision or rob.reach_goal:
                     rob.deactivated = True
                     ep_deactivated_t[i] = ep_length
+            
+            # Pack and push transitions to GPU replay buffer (non-Rainbow)
+            if self.rl_agent.training and self.rl_agent.agent_type != "Rainbow":
+                B = td["self_state"].shape[0]
+                is_discrete = self.rl_agent.agent_type in ("IQN", "DQN")
+                actions = td["action"]
+                if is_discrete:
+                    actions = actions.round().long().view(B, 1)
+                else:
+                    actions = actions.to(dtype=torch.float32)
+                transition = TensorDict(
+                    {
+                        "self_state": td["self_state"],
+                        "objects_state": td["objects_state"],
+                        "objects_mask": td["objects_mask"],
+                        "action": actions,
+                        "reward": td_next["reward"],
+                        "done": td_next["done"],
+                        ("next", "self_state"): td_next["self_state"],
+                        ("next", "objects_state"): td_next["objects_state"],
+                        ("next", "objects_mask"): td_next["objects_mask"],
+                    },
+                    batch_size=[B],
+                    device=self.device,
+                )
+                # filter out deactivated robots to avoid storing padded slots
+                active_mask = torch.tensor([not rob.deactivated for rob in self.train_env.robots],
+                                           device=self.device, dtype=torch.bool)
+                if active_mask.any():
+                    transition_active = transition[active_mask]
+                    if transition_active.shape[0] > 0:
+                        self.rl_agent.memory.add(transition_active)
             
             end_episode = (ep_length >= 1000) or self.train_env.check_all_deactivated()
             

@@ -358,14 +358,28 @@ class Agent():
     #     return cvar
         
     def state_to_tensor(self,states):
-        self_state_batch,object_batch,object_batch_mask = states
-        
-        self_state_batch = torch.tensor(self_state_batch).float().to(self.device)
-        empty = (len(object_batch) == 0)
-        object_batch = None if empty else torch.tensor(object_batch).float().to(self.device)
-        object_batch_mask = None if empty else torch.tensor(object_batch_mask).float().to(self.device)
+        self_state_batch, object_batch, object_batch_mask = states
 
-        return (self_state_batch,object_batch,object_batch_mask)
+        if torch.is_tensor(self_state_batch):
+            self_state_batch = self_state_batch.to(self.device, dtype=torch.float32)
+        else:
+            self_state_batch = torch.tensor(self_state_batch, dtype=torch.float32, device=self.device)
+
+        if object_batch is None:
+            obj = None
+        elif torch.is_tensor(object_batch):
+            obj = object_batch.to(self.device, dtype=torch.float32)
+        else:
+            obj = torch.tensor(object_batch, dtype=torch.float32, device=self.device)
+
+        if object_batch_mask is None:
+            obj_mask = None
+        elif torch.is_tensor(object_batch_mask):
+            obj_mask = object_batch_mask.to(self.device, dtype=torch.float32)
+        else:
+            obj_mask = torch.tensor(object_batch_mask, dtype=torch.float32, device=self.device)
+
+        return (self_state_batch, obj, obj_mask)
 
     def train(self):
         if self.agent_type == "AC-IQN":
@@ -384,12 +398,12 @@ class Agent():
             raise RuntimeError("Agent type not implemented!")
 
     def train_AC_IQN(self):
-        states, actions, rewards, next_states, dones = self.memory.sample()
+        states, actions, rewards, next_states, dones = self.memory.sample(self.BATCH_SIZE)
         states = self.state_to_tensor(states)
-        actions = torch.tensor(actions).float().to(self.device)
-        rewards = torch.tensor(rewards).unsqueeze(-1).float().to(self.device)
+        actions = actions.to(self.device, dtype=torch.float32)
+        rewards = rewards.to(self.device, dtype=torch.float32)
         next_states = self.state_to_tensor(next_states)
-        dones = torch.tensor(dones).unsqueeze(-1).float().to(self.device)
+        dones = dones.to(self.device, dtype=torch.float32)
 
         # update critic network
         self.critic_optimizer.zero_grad()
@@ -439,12 +453,12 @@ class Agent():
             gamma (float): discount factor
         """
 
-        states, actions, rewards, next_states, dones = self.memory.sample()
+        states, actions, rewards, next_states, dones = self.memory.sample(self.BATCH_SIZE)
         states = self.state_to_tensor(states)
-        actions = torch.tensor(actions).unsqueeze(-1).to(self.device)
-        rewards = torch.tensor(rewards).unsqueeze(-1).float().to(self.device)
+        actions = actions.to(self.device, dtype=torch.int64)
+        rewards = rewards.to(self.device, dtype=torch.float32)
         next_states = self.state_to_tensor(next_states)
-        dones = torch.tensor(dones).unsqueeze(-1).float().to(self.device)
+        dones = dones.to(self.device, dtype=torch.float32)
 
         self.optimizer.zero_grad()
         # Get max predicted Q values (for next states) from target model
@@ -476,12 +490,12 @@ class Agent():
         return loss.detach().cpu().numpy()
     
     def train_DDPG(self):
-        states, actions, rewards, next_states, dones = self.memory.sample()
+        states, actions, rewards, next_states, dones = self.memory.sample(self.BATCH_SIZE)
         states = self.state_to_tensor(states)
-        actions = torch.tensor(actions).float().to(self.device)
-        rewards = torch.tensor(rewards).unsqueeze(-1).float().to(self.device)
+        actions = actions.to(self.device, dtype=torch.float32)
+        rewards = rewards.to(self.device, dtype=torch.float32)
         next_states = self.state_to_tensor(next_states)
-        dones = torch.tensor(dones).unsqueeze(-1).float().to(self.device)
+        dones = dones.to(self.device, dtype=torch.float32)
 
         # update critic network
         self.critic_optimizer.zero_grad()
@@ -516,12 +530,12 @@ class Agent():
         return critic_loss.detach().cpu().numpy(), actor_loss.detach().cpu().numpy()
     
     def train_DQN(self):
-        states, actions, rewards, next_states, dones = self.memory.sample()
+        states, actions, rewards, next_states, dones = self.memory.sample(self.BATCH_SIZE)
         states = self.state_to_tensor(states)
-        actions = torch.tensor(actions).unsqueeze(-1).to(self.device)
-        rewards = torch.tensor(rewards).unsqueeze(-1).float().to(self.device)
+        actions = actions.to(self.device, dtype=torch.int64)
+        rewards = rewards.to(self.device, dtype=torch.float32)
         next_states = self.state_to_tensor(next_states)
-        dones = torch.tensor(dones).unsqueeze(-1).float().to(self.device)
+        dones = dones.to(self.device, dtype=torch.float32)
 
         self.optimizer.zero_grad()
 
@@ -546,12 +560,12 @@ class Agent():
     
     def train_SAC(self):
         ### Based on the function in line 226 of (https://github.com/thu-ml/tianshou/blob/master/tianshou/policy/modelfree/sac.py)
-        states, actions, rewards, next_states, dones = self.memory.sample()
+        states, actions, rewards, next_states, dones = self.memory.sample(self.BATCH_SIZE)
         states = self.state_to_tensor(states)
-        actions = torch.tensor(actions).float().to(self.device)
-        rewards = torch.tensor(rewards).unsqueeze(-1).float().to(self.device)
+        actions = actions.to(self.device, dtype=torch.float32)
+        rewards = rewards.to(self.device, dtype=torch.float32)
         next_states = self.state_to_tensor(next_states)
-        dones = torch.tensor(dones).unsqueeze(-1).float().to(self.device)
+        dones = dones.to(self.device, dtype=torch.float32)
 
         with torch.no_grad():
             next_actions, next_log_probs = self.policy_target.actor(next_states)
