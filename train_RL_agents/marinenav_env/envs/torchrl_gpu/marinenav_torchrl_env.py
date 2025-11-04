@@ -2,7 +2,7 @@ import torch
 import numpy as np
 from torchrl.envs import EnvBase
 from tensordict import TensorDict
-from torchrl.data import CompositeSpec, UnboundedContinuousTensorSpec, DiscreteTensorSpec, BoundedTensorSpec
+from torchrl.data import Composite, Unbounded, DiscreteTensorSpec, Bounded
 from marinenav_env.envs.marinenav_env import MarineNavEnv3
 
 
@@ -41,29 +41,29 @@ class MarineNavTorchRLEnv(EnvBase):
     # ---- Specs ----
     def _make_spec(self):
         # Specs are per env; EnvBase(batch_size=[E]) adds the E leading batch dim
-        self.observation_spec = CompositeSpec(
-            self_state=UnboundedContinuousTensorSpec(
+        self.observation_spec = Composite(
+            self_state=Unbounded(
                 shape=(self.num_robots, self.self_dim),
                 device=self.device,
                 dtype=torch.float32,
             ),
-            objects_state=UnboundedContinuousTensorSpec(
+            objects_state=Unbounded(
                 shape=(self.num_robots, self.max_obj_num, self.obj_dim),
                 device=self.device,
                 dtype=torch.float32,
             ),
-            objects_mask=BoundedTensorSpec(
+            objects_mask=Bounded(
                 low=0,
                 high=1,
                 shape=(self.num_robots, self.max_obj_num),
                 device=self.device,
                 dtype=torch.float32,
             ),
-            shape=(),
+            shape=(self.E,),
         )
 
         # Action is either continuous [R, 2] or discrete index [R, 1]. We expose continuous bounds.
-        self.action_spec = BoundedTensorSpec(
+        self.action_spec = Bounded(
             low=-1.0,
             high=1.0,
             shape=(self.num_robots, 2),
@@ -71,7 +71,7 @@ class MarineNavTorchRLEnv(EnvBase):
             dtype=torch.float32,
         )
 
-        self.reward_spec = UnboundedContinuousTensorSpec(
+        self.reward_spec = Unbounded(
             shape=(self.num_robots, 1),
             device=self.device,
             dtype=torch.float32,
