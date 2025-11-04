@@ -59,30 +59,32 @@ class MarineNavTorchRLEnv(EnvBase):
                 device=self.device,
                 dtype=torch.float32,
             ),
-            shape=(self.E,),
-        )
+        ).expand(self.batch_size)
 
         # Action is either continuous [R, 2] or discrete index [R, 1]. We expose continuous bounds.
-        self.action_spec = Bounded(
+        action_spec = Bounded(
             low=-1.0,
             high=1.0,
             shape=(self.num_robots, 2),
             device=self.device,
             dtype=torch.float32,
         )
+        self.action_spec = action_spec.expand(self.batch_size + action_spec.shape)
 
-        self.reward_spec = Unbounded(
+        reward_spec = Unbounded(
             shape=(self.num_robots, 1),
             device=self.device,
             dtype=torch.float32,
         )
+        self.reward_spec = reward_spec.expand(self.batch_size + reward_spec.shape)
 
-        self.done_spec = DiscreteTensorSpec(
+        done_spec = DiscreteTensorSpec(
             n=2,
             shape=(self.num_robots, 1),
             device=self.device,
             dtype=torch.bool,
         )
+        self.done_spec = done_spec.expand(self.batch_size + done_spec.shape)
 
     def _alloc_buffers(self):
         E, R = self.E, self.num_robots
@@ -129,17 +131,38 @@ class MarineNavTorchRLEnv(EnvBase):
 
         next_states_all = []
         for e in range(E):
+            env_e = self._envs[e]
+
+            if env_e.check_all_reach_goal() or env_e.check_all_deactivated():
+                states, _, _ = env_e.reset()
+                next_states_all.append(states)
+                limit = min(self.num_robots, len(states))
+                if limit > 0:
+                    self._buf_done[e, :limit, 0] = True
+                continue
+
             act_e = actions_cpu[e].numpy()
             # Determine discrete vs continuous by last dim
             is_discrete = act_e.shape[-1] == 1
             if is_discrete:
-                action_list = [int(act_e[i, 0]) for i in range(min(len(self._envs[e].robots), act_e.shape[0]))]
+                action_list = [int(act_e[i, 0]) for i in range(min(len(env_e.robots), act_e.shape[0]))]
                 is_continuous_action = False
             else:
-                action_list = [act_e[i] for i in range(min(len(self._envs[e].robots), act_e.shape[0]))]
+                action_list = [act_e[i] for i in range(min(len(env_e.robots), act_e.shape[0]))]
                 is_continuous_action = True
 
-            next_states, rewards, dones, infos = self._envs[e].step(action_list, is_continuous_action)
+            try:
+                next_states, rewards, dones, infos = env_e.step(action_list, is_continuous_action)
+            except AssertionError as err:
+                if "All robots reach goals" in str(err):
+                    states, _, _ = env_e.reset()
+                    next_states_all.append(states)
+                    limit = min(self.num_robots, len(states))
+                    if limit > 0:
+                        self._buf_done[e, :limit, 0] = True
+                    continue
+                raise
+
             next_states_all.append(next_states)
 
             # Pad rewards/dones to R

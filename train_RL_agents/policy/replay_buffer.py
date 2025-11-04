@@ -3,8 +3,16 @@ from collections import deque
 import torch
 import copy
 from tensordict import TensorDict
-from torchrl.data import ReplayBuffer as TorchRLReplayBuffer
-from torchrl.data import TensorStorage, RandomSampler
+from torchrl.data import ReplayBuffer as TorchRLReplayBuffer, RandomSampler
+
+try:
+    from torchrl.data import TensorStorage
+except ImportError:  # pragma: no cover - older versions may not expose TensorStorage
+    TensorStorage = None
+try:
+    from torchrl.data import LazyTensorStorage
+except ImportError:  # pragma: no cover - fallback for very old versions
+    LazyTensorStorage = None
 
 
 class ReplayBuffer:
@@ -92,8 +100,12 @@ class TensorDictReplayBuffer:
 
     def __init__(self, capacity, device="cuda"):
         self.device = torch.device(device)
-        self._rb = TorchRLReplayBuffer(storage=TensorStorage(max_size=capacity, device=self.device),
-                                       sampler=RandomSampler())
+
+        if LazyTensorStorage is None:
+            raise RuntimeError("LazyTensorStorage is required but not available in the current TorchRL version.")
+
+        storage = LazyTensorStorage(max_size=capacity, device=self.device)
+        self._rb = TorchRLReplayBuffer(storage=storage, sampler=RandomSampler())
 
     def add(self, td_or_batch_td: TensorDict):
         """
