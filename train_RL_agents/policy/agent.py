@@ -200,7 +200,7 @@ class Agent():
                 raise RuntimeError("Agent type not implemented!")
 
             if agent_type == "Rainbow":
-                self.memory = ReplayMemory(device,BUFFER_SIZE)
+                self.memory = ReplayMemory(device, BUFFER_SIZE, gamma=self.GAMMA, n=self.n)
             else:
                 self.memory = ReplayBuffer(BUFFER_SIZE,BATCH_SIZE,object_dimension,max_object_num)
     
@@ -610,7 +610,7 @@ class Agent():
     
     def train_Rainbow(self):
         ### Based on the function in line 61 of (https://github.com/Kaixhin/Rainbow/blob/master/agent.py)
-        
+
         # Sample transitions
         idxs, states, actions, returns, next_states, nonterminals, weights = self.memory.sample(self.BATCH_SIZE)
 
@@ -653,6 +653,41 @@ class Agent():
         self.memory.update_priorities(idxs, loss.detach().cpu().numpy())  # Update priorities of sampled transitions
 
         return loss.detach().cpu().numpy()
+
+    def rainbow_loss_from_batch(self, states, actions, returns, next_states, nonterminals):
+        """
+        Compute per-sample Rainbow distributional loss, without optimizer step.
+        Returns a vector of shape [B].
+        """
+        B = actions.shape[0]
+        # Current state log-probabilities
+        log_ps = self.policy_local(states, log=True)  # [B, A, atoms]
+        log_ps_a = log_ps[range(B), actions]  # [B, atoms]
+
+        with torch.no_grad():
+            # Online network for argmax
+            pns = self.policy_local(next_states)  # [B, A, atoms]
+            dns = self.support.expand_as(pns) * pns
+            argmax_indices_ns = dns.sum(2).argmax(1)
+            # Target network
+            self.policy_target.reset_noise()
+            pns = self.policy_target(next_states)
+            pns_a = pns[range(B), argmax_indices_ns]
+
+            # Compute projected distribution
+            Tz = returns.unsqueeze(1) + nonterminals * (self.GAMMA ** self.n) * self.support.unsqueeze(0)
+            Tz = Tz.clamp(min=self.Vmin, max=self.Vmax)
+            b = (Tz - self.Vmin) / self.delta_z
+            l, u = b.floor().to(torch.int64), b.ceil().to(torch.int64)
+            l[(u > 0) * (l == u)] -= 1
+            u[(l < (self.atoms - 1)) * (l == u)] += 1
+            m = torch.zeros(B, self.atoms, dtype=torch.float32, device=self.device)
+            offset = torch.linspace(0, ((B - 1) * self.atoms), B).unsqueeze(1).expand(B, self.atoms).to(actions)
+            m.view(-1).index_add_(0, (l + offset).view(-1), (pns_a * (u.float() - b)).view(-1))
+            m.view(-1).index_add_(0, (u + offset).view(-1), (pns_a * (b - l.float())).view(-1))
+
+        loss = -torch.sum(m * log_ps_a, 1)
+        return loss
 
     def soft_update(self):
         """Soft update model parameters.
