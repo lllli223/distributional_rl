@@ -31,7 +31,14 @@ class MLPPolicy(nn.Module):
         return self.net(obs)
 
     def forward(self, tensordict: TensorDict) -> TensorDict:
-        obs = tensordict.get("observation")
+        # robustly fetch observation key in case of version differences
+        if "observation" in tensordict.keys():
+            obs = tensordict.get("observation")
+        else:
+            try:
+                obs = tensordict.get(("next", "observation"))
+            except Exception:
+                obs = tensordict.get("observation")
         action = self.net(obs)
         tensordict.set_("action", action)
         return tensordict
@@ -109,7 +116,14 @@ def train(
             if len(replay_buffer) < 1024:
                 break
             td = replay_buffer.sample(1024).to(device)
-            obs = td.get("observation")
+            # robustly fetch observation from replay sample
+            if "observation" in td.keys():
+                obs = td.get("observation")
+            else:
+                try:
+                    obs = td.get(("next", "observation"))
+                except Exception:
+                    obs = td.get("observation")  # will raise if truly missing
             # policy forward (train mode)
             pred_action = policy.net(obs)
             # simple L2 loss to keep actions bounded and exercise training
@@ -123,7 +137,8 @@ def train(
             with open(os.path.join(log_dir, "progress.txt"), "a+") as f:
                 f.write(f"iter={it}, buffer_size={len(replay_buffer)}\n")
 
-        if collector._frames >= total_frames:
+        # rely on the collector to stop when total_frames is reached; guard for older versions
+        if hasattr(collector, "_frames") and collector._frames >= total_frames:
             break
 
 
@@ -140,8 +155,16 @@ if __name__ == "__main__":
     parser.add_argument("--log-dir", type=str, default=None)
     args = parser.parse_args()
 
+    # Fallback to CPU if CUDA is requested but not available (no change to training logic otherwise)
+    device = args.device
+    try:
+        if device.startswith("cuda") and not torch.cuda.is_available():
+            device = "cpu"
+    except Exception:
+        pass
+
     train(
-        device=args.device,
+        device=device,
         seed=args.seed,
         num_envs=args.num_envs,
         frames_per_batch=args.frames_per_batch,
