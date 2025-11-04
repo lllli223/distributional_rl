@@ -77,8 +77,10 @@ def run_trial(device, params):
     with open(param_file, "w+") as outfile:
         json.dump(params, outfile)
 
-    train_env = MarineNavTorchRLEnv(seed=seed, schedule=params["training_schedule"], device=device)
-    eval_env = MarineNavTorchRLEnv(seed=253, is_eval_env=True, device=device)
+    # Optional explicit E parallelism
+    env_batch_size = params.get("env_batch_size", 1)
+    train_env = MarineNavTorchRLEnv(seed=seed, schedule=params["training_schedule"], device=device, env_batch_size=env_batch_size)
+    eval_env = MarineNavTorchRLEnv(seed=253, is_eval_env=True, device=device, env_batch_size=1)
 
     rl_agent = Agent(device=device, seed=seed + 100, agent_type=params["agent_type"])
 
@@ -94,6 +96,14 @@ def run_trial(device, params):
         imitation=params["imitation_learning"],
         il_agent=None,
     )
+
+    # Optional large-batch training controls
+    if "train_batch_size_total" in params:
+        trainer.train_batch_size_total = params["train_batch_size_total"]
+    if "grad_accum_steps" in params:
+        trainer.grad_accum_steps = params["grad_accum_steps"]
+    if "amp_enabled" in params:
+        trainer.amp_enabled = params["amp_enabled"]
 
     trainer.save_eval_config(exp_dir)
 

@@ -76,14 +76,16 @@ class TorchRLTrainer:
         count = 0
         for i, num_episode in enumerate(eval_schedule["num_episodes"]):
             for _ in range(num_episode):
-                self.eval_env._env.num_robots = eval_schedule["num_robots"][i]
-                self.eval_env._env.num_cores = eval_schedule["num_cores"][i]
-                self.eval_env._env.num_obs = eval_schedule["num_obstacles"][i]
-                self.eval_env._env.min_start_goal_dis = eval_schedule["min_start_goal_dis"][i]
+                # Evaluation env is single (E=1)
+                base_env = self.eval_env._envs[0]
+                base_env.num_robots = eval_schedule["num_robots"][i]
+                base_env.num_cores = eval_schedule["num_cores"][i]
+                base_env.num_obs = eval_schedule["num_obstacles"][i]
+                base_env.min_start_goal_dis = eval_schedule["min_start_goal_dis"][i]
                 
-                self.eval_env._env.reset()
+                base_env.reset()
                 
-                self.eval_config.append(self.eval_env._env.episode_data())
+                self.eval_config.append(base_env.episode_data())
                 count += 1
     
     def save_eval_config(self, directory):
@@ -93,131 +95,157 @@ class TorchRLTrainer:
     
     def learn(self, total_timesteps, eval_freq, eval_log_path, verbose=True):
         td = self.train_env.reset()
-        
-        ep_rewards = np.zeros(len(self.train_env.robots))
-        ep_deactivated_t = [-1] * len(self.train_env.robots)
+
+        # E×R dimensions
+        E = td.batch_size[0] if len(td.batch_size) > 0 else 1
+        R = self.train_env.num_robots
+
+        def flatten_ER_obs(td_obs):
+            # Only observation keys
+            return TensorDict(
+                {
+                    "self_state": td_obs["self_state"].reshape(E * R, -1),
+                    "objects_state": td_obs["objects_state"].reshape(E * R, td_obs["objects_state"].shape[2], td_obs["objects_state"].shape[3]),
+                    "objects_mask": td_obs["objects_mask"].reshape(E * R, -1),
+                },
+                batch_size=[E * R],
+                device=self.device,
+            )
+
+        def flatten_ER_transition(td_curr, td_next, actions_flat):
+            B = E * R
+            return TensorDict(
+                {
+                    "self_state": td_curr["self_state"].reshape(B, -1),
+                    "objects_state": td_curr["objects_state"].reshape(B, td_curr["objects_state"].shape[2], td_curr["objects_state"].shape[3]),
+                    "objects_mask": td_curr["objects_mask"].reshape(B, -1),
+                    "action": actions_flat,
+                    "reward": td_next["reward"].reshape(B, 1),
+                    "done": td_next["done"].reshape(B, 1),
+                    ("next", "self_state"): td_next["self_state"].reshape(B, -1),
+                    ("next", "objects_state"): td_next["objects_state"].reshape(B, td_next["objects_state"].shape[2], td_next["objects_state"].shape[3]),
+                    ("next", "objects_mask"): td_next["objects_mask"].reshape(B, -1),
+                },
+                batch_size=[B],
+                device=self.device,
+            )
+
         ep_length = 0
         ep_num = 0
-        
+
+        # Precompute stream ids for Rainbow n-step builder (env_id * R + robot_id)
+        env_ids = torch.arange(E, device=self.device).view(E, 1).expand(E, R)
+        robot_ids = torch.arange(R, device=self.device).view(1, R).expand(E, R)
+        stream_ids = (env_ids * R + robot_ids).reshape(E * R)
+
+        # Gradient accumulation / AMP settings for Rainbow
+        train_batch_size_total = getattr(self, "train_batch_size_total", self.rl_agent.BATCH_SIZE)
+        grad_accum_steps = getattr(self, "grad_accum_steps", 1)
+        amp_enabled = getattr(self, "amp_enabled", (self.device.type == "cuda"))
+
         while self.current_timestep <= total_timesteps:
             if not self.imitation:
                 eps = self.linear_eps(total_timesteps)
                 self.policy_wrapper.set_epsilon(eps)
-            
-            td = self.policy_wrapper(td)
-            
-            td_next = self.train_env.step(td)
-            
-            # GPU-only bookkeeping and replay writing
-            rewards_tensor = td_next["reward"].squeeze(-1)  # [B]
-            # dones are available if needed: dones_tensor = td_next["done"].squeeze(-1)
-            
-            for i, rob in enumerate(self.train_env.robots):
-                if rob.deactivated:
-                    continue
-                ep_rewards[i] += (self.rl_agent.GAMMA ** ep_length) * rewards_tensor[i].item()
-                if rob.collision or rob.reach_goal:
-                    rob.deactivated = True
-                    ep_deactivated_t[i] = ep_length
-            
-            # Pack and push transitions to GPU replay buffer (non-Rainbow)
-            if self.rl_agent.training and self.rl_agent.agent_type != "Rainbow":
-                B = td["self_state"].shape[0]
-                is_discrete = self.rl_agent.agent_type in ("IQN", "DQN")
-                actions = td["action"]
+
+            # Flatten E×R for policy forward
+            td_flat = flatten_ER_obs(td)
+            td_actions = self.policy_wrapper(td_flat)  # sets "action"
+            actions_flat = td_actions["action"]
+            # Unflatten to (E, R, A)
+            action_dim = actions_flat.shape[-1]
+            actions_ER = actions_flat.view(E, R, action_dim)
+
+            td_next = self.train_env.step(TensorDict({"action": actions_ER}, batch_size=[E], device=self.device))
+
+            # Pack and push transitions to replay buffer(s)
+            if self.rl_agent.training:
+                # Determine action dtype per agent
+                is_discrete = self.rl_agent.agent_type in ("IQN", "DQN", "Rainbow")
                 if is_discrete:
-                    actions = actions.round().long().view(B, 1)
+                    actions_store = actions_flat.round().long().view(E * R, 1)
                 else:
-                    actions = actions.to(dtype=torch.float32)
-                transition = TensorDict(
-                    {
-                        "self_state": td["self_state"],
-                        "objects_state": td["objects_state"],
-                        "objects_mask": td["objects_mask"],
-                        "action": actions,
-                        "reward": td_next["reward"],
-                        "done": td_next["done"],
-                        ("next", "self_state"): td_next["self_state"],
-                        ("next", "objects_state"): td_next["objects_state"],
-                        ("next", "objects_mask"): td_next["objects_mask"],
-                    },
-                    batch_size=[B],
-                    device=self.device,
-                )
-                # filter out deactivated robots to avoid storing padded slots
-                active_mask = torch.tensor([not rob.deactivated for rob in self.train_env.robots],
-                                           device=self.device, dtype=torch.bool)
-                if active_mask.any():
-                    transition_active = transition[active_mask]
-                    if transition_active.shape[0] > 0:
-                        self.rl_agent.memory.add(transition_active)
-            
-            end_episode = (ep_length >= 1000) or self.train_env.check_all_deactivated()
-            
-            if self.current_timestep >= self.learning_starts:
-                if not self.rl_agent.training:
-                    continue
-                
+                    actions_store = actions_flat.to(dtype=torch.float32)
+
+                transition_flat = flatten_ER_transition(td, td_next, actions_store)
+
+                # Active mask to skip already-done slots
+                active_mask = (~td_next["done"].squeeze(-1)).reshape(E * R)
+
+                if self.rl_agent.agent_type == "Rainbow":
+                    if active_mask.any():
+                        self.rl_agent.memory.add_batch(transition_flat[active_mask], stream_ids[active_mask])
+                else:
+                    if active_mask.any():
+                        self.rl_agent.memory.add(transition_flat[active_mask])
+
+            # Episode control: keep global episode semantics (reset all envs together)
+            end_episode = (ep_length >= 1000)
+
+            if self.current_timestep >= self.learning_starts and self.rl_agent.training:
                 if self.current_timestep % self.UPDATE_EVERY == 0:
-                    num_elements = self.rl_agent.memory.transitions.num_elements() if self.rl_agent.agent_type == \
-                                   "Rainbow" else self.rl_agent.memory.size()
-                    
+                    num_elements = (
+                        self.rl_agent.memory.transitions.num_elements()
+                        if self.rl_agent.agent_type == "Rainbow"
+                        else self.rl_agent.memory.size()
+                    )
+
                     if num_elements > self.rl_agent.BATCH_SIZE:
-                        self.rl_agent.train()
-                
+                        if self.rl_agent.agent_type == "Rainbow":
+                            # Large batch, gradient accumulation, AMP
+                            self.rl_agent.optimizer.zero_grad()
+                            micro_bs = max(1, train_batch_size_total // max(1, grad_accum_steps))
+                            for _ in range(grad_accum_steps):
+                                idxs, states, actions, returns, next_states, nonterminals, weights = self.rl_agent.memory.sample(micro_bs)
+                                with torch.cuda.amp.autocast(enabled=amp_enabled):
+                                    loss_per = self.rl_agent.rainbow_loss_from_batch(states, actions, returns, next_states, nonterminals)
+                                    loss = (weights.to(self.device) * loss_per).mean()
+                                (loss / max(1, grad_accum_steps)).backward()
+                                # priority update per micro-batch
+                                self.rl_agent.memory.update_priorities(idxs, loss_per.detach())
+                            torch.nn.utils.clip_grad_norm_(self.rl_agent.policy_local.parameters(), 0.5)
+                            self.rl_agent.optimizer.step()
+                        else:
+                            # Fallback to agents' original train routine
+                            self.rl_agent.train()
+
                 if self.current_timestep % self.target_update_interval == 0:
                     self.rl_agent.soft_update()
-                
+
                 if self.current_timestep == self.learning_starts or self.current_timestep % eval_freq == 0:
                     self.evaluation()
                     self.save_evaluation(eval_log_path)
-                    
-                    if not self.rl_agent.training:
-                        continue
-                    
-                    self.rl_agent.save_latest_model(eval_log_path)
-            
+
+                    if self.rl_agent.training:
+                        self.rl_agent.save_latest_model(eval_log_path)
+
             if end_episode:
                 ep_num += 1
-                
                 if verbose:
                     if self.imitation:
                         print("======== IL Episode Info ========")
                     else:
                         print("======== RL Episode Info ========")
-                    
                     print("current ep_length: ", ep_length)
                     print("current ep_num: ", ep_num)
-                    
                     if not self.imitation:
                         print("current exploration rate: ", eps)
-                    
                     print("current timesteps: ", self.current_timestep)
                     print("total timesteps: ", total_timesteps)
                     print("======== Episode Info ========\n")
-                    print("======== Robots Info ========")
-                    for i, rob in enumerate(self.train_env.robots):
-                        info_state = "normal"
-                        if rob.collision:
-                            info_state = "deactivated after collision"
-                        elif rob.reach_goal:
-                            info_state = "deactivated after reaching goal"
-                        
-                        if info_state != "normal":
-                            print(f"Robot {i} ep reward: {ep_rewards[i]:.2f}, {info_state} at step {ep_deactivated_t[i]}")
-                        else:
-                            print(f"Robot {i} ep reward: {ep_rewards[i]:.2f}, {info_state}")
-                    print("======== Robots Info ========\n")
-                
                 td = self.train_env.reset()
-                
-                ep_rewards = np.zeros(len(self.train_env.robots))
-                ep_deactivated_t = [-1] * len(self.train_env.robots)
+                # Reset counters
                 ep_length = 0
+                # Re-read in case schedule changed
+                E = td.batch_size[0] if len(td.batch_size) > 0 else 1
+                R = self.train_env.num_robots
+                env_ids = torch.arange(E, device=self.device).view(E, 1).expand(E, R)
+                robot_ids = torch.arange(R, device=self.device).view(1, R).expand(E, R)
+                stream_ids = (env_ids * R + robot_ids).reshape(E * R)
             else:
                 td = td_next
                 ep_length += 1
-            
+
             self.current_timestep += 1
     
     def linear_eps(self, total_timesteps):
@@ -254,8 +282,19 @@ class TorchRLTrainer:
             length = 0
             
             while not end_episode:
-                td = self.policy_wrapper(td)
-                td_next = self.eval_env._step(td)
+                # Flatten (E=1,R,...) -> (R,...)
+                obs_flat = TensorDict(
+                    {
+                        "self_state": td["self_state"].squeeze(0),
+                        "objects_state": td["objects_state"].squeeze(0),
+                        "objects_mask": td["objects_mask"].squeeze(0),
+                    },
+                    batch_size=[rob_num],
+                    device=self.device,
+                )
+                td_actions = self.policy_wrapper(obs_flat)
+                actions = td_actions["action"].view(1, rob_num, -1)
+                td_next = self.eval_env._step(TensorDict({"action": actions}, batch_size=[1], device=self.device))
                 
                 reward_vals = td_next["reward"].cpu().numpy().flatten()
                 
