@@ -67,6 +67,37 @@ def train(
         print(f"Requested CUDA device but CUDA is not available. Falling back to CPU.")
         device = torch.device("cpu")
 
+    # Adjust frames_per_batch to be divisible by num_envs and total_frames to be a multiple of frames_per_batch
+    if num_envs > 0:
+        if frames_per_batch % num_envs != 0:
+            lower = (frames_per_batch // num_envs) * num_envs
+            upper = lower + num_envs
+            # avoid zero lower
+            if lower <= 0:
+                frames_per_batch_adj = upper
+            else:
+                # pick the closest multiple
+                if abs(frames_per_batch - lower) <= abs(upper - frames_per_batch):
+                    frames_per_batch_adj = lower
+                else:
+                    frames_per_batch_adj = upper
+        else:
+            frames_per_batch_adj = frames_per_batch
+    else:
+        frames_per_batch_adj = frames_per_batch
+
+    if total_frames % frames_per_batch_adj != 0:
+        total_frames_adj = ((total_frames + frames_per_batch_adj - 1) // frames_per_batch_adj) * frames_per_batch_adj
+    else:
+        total_frames_adj = total_frames
+
+    if frames_per_batch_adj != frames_per_batch or total_frames_adj != total_frames:
+        print(
+            f"Adjusted frames_per_batch from {frames_per_batch} to {frames_per_batch_adj} and total_frames from {total_frames} to {total_frames_adj} to avoid TorchRL collector warnings."
+        )
+    frames_per_batch = frames_per_batch_adj
+    total_frames = total_frames_adj
+
     # Build env on device
     env = make_env(num_envs=num_envs, device=device, seed=seed)
 
