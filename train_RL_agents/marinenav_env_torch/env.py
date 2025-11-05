@@ -136,8 +136,8 @@ class MarineNavTorchRLEnv(EnvBase):
         if dtype is None:
             dtype = torch.float32
 
+        device = torch.device(device)
         super().__init__(device=device)
-        self.device = torch.device(device)
         self.dtype = dtype
 
         if num_envs <= 0:
@@ -171,6 +171,8 @@ class MarineNavTorchRLEnv(EnvBase):
         obs_np = _pad_and_stack_batch_observations(batch_obs, max_obj_num=self.max_obj_num, dtype=np.float32)
         self._last_obs = torch.as_tensor(obs_np, device=self.device, dtype=self.dtype)
 
+        self.batch_size = torch.Size([self.num_envs, self.num_robots])
+
     # TorchRL EnvBase API
     def _reset(self, tensordict: Optional[TensorDict] = None) -> TensorDict:
         batch_obs: List[List[Tuple[Optional[List[float]], Optional[List[List[float]]]]]] = []
@@ -187,6 +189,7 @@ class MarineNavTorchRLEnv(EnvBase):
             self.max_obj_num = (
                 self._envs[0].robots[0].perception.max_obj_num if len(self._envs[0].robots) > 0 else self.max_obj_num
             )
+        self.batch_size = torch.Size([self.num_envs, self.num_robots])
         obs_np = _pad_and_stack_batch_observations(batch_obs, max_obj_num=self.max_obj_num, dtype=np.float32)
         obs = torch.as_tensor(obs_np, device=self.device, dtype=self.dtype)
         self._last_obs = obs
@@ -275,9 +278,10 @@ class MarineNavTorchRLEnv(EnvBase):
             "action_dim": 2,
         }
 
-    def set_seed(self, seed: Optional[int] = None) -> None:
+    def _set_seed(self, seed: Optional[int] = None) -> Optional[int]:
         if seed is None:
-            return
+            return None
+
         # Recreate the underlying env random state by re-instantiation semantics
         schedule = self._envs[0].schedule if self._envs else None
         is_eval_env = self._envs[0].is_eval_env if self._envs else False
@@ -300,5 +304,11 @@ class MarineNavTorchRLEnv(EnvBase):
         self.max_obj_num = (
             self._envs[0].robots[0].perception.max_obj_num if len(self._envs[0].robots) > 0 else self.max_obj_num
         )
+        self.batch_size = torch.Size([self.num_envs, self.num_robots])
         obs_np = _pad_and_stack_batch_observations(batch_obs, max_obj_num=self.max_obj_num, dtype=np.float32)
         self._last_obs = torch.as_tensor(obs_np, device=self.device, dtype=self.dtype)
+        return seed
+
+    @property
+    def _has_dynamic_specs(self) -> bool:
+        return False
