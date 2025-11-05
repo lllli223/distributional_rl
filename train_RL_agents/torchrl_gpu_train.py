@@ -33,7 +33,7 @@ class MLPPolicy(nn.Module):
     def forward(self, tensordict: TensorDict) -> TensorDict:
         obs = tensordict.get("observation")
         action = self.net(obs)
-        tensordict.set_("action", action)
+        tensordict.set("action", action)
         return tensordict
 
 
@@ -61,6 +61,11 @@ def train(
     log_dir: Optional[str] = None,
 ):
     torch.manual_seed(seed)
+
+    device = torch.device(device)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        print(f"Requested CUDA device but CUDA is not available. Falling back to CPU.")
+        device = torch.device("cpu")
 
     # Build env on device
     env = make_env(num_envs=num_envs, device=device, seed=seed)
