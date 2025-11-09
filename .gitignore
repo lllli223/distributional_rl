@@ -13,3 +13,4 @@ test*
 experiment*
 vrx_experiment_results/
 vrx_visualize_episodes/
+.venv/

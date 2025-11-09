@@ -66,6 +66,10 @@ class MarineNavEnv3(gym.Env):
         self.total_timesteps = 0 # learning timesteps
 
         self.observation_in_robot_frame = True # return observation in robot frame
+        # Prepacked core arrays (filled on reset)
+        self.core_pos = None
+        self.core_gamma = None
+        self.core_sign = None
     
     def get_action_space_dimension(self):
         return self.robots[0].compute_actions_dimension()
@@ -136,17 +140,15 @@ class MarineNavEnv3(gym.Env):
                 if iteration == 0 or num_cores == 0:
                     break
         
-        centers = None
-        for core in self.cores:
-            if centers is None:
-                centers = np.array([[core.x,core.y]])
-            else:
-                c = np.array([[core.x,core.y]])
-                centers = np.vstack((centers,c))
-        
-        # KDTree storing vortex core center positions
-        if centers is not None:
-            self.core_centers = scipy.spatial.KDTree(centers)
+        # Pack core attributes into fixed ndarrays for fast velocity queries
+        if len(self.cores) > 0:
+            self.core_pos = np.array([[core.x, core.y] for core in self.cores], dtype=float)
+            self.core_gamma = np.array([core.Gamma for core in self.cores], dtype=float)
+            self.core_sign = np.array([1.0 if core.clockwise else -1.0 for core in self.cores], dtype=float)
+        else:
+            self.core_pos = None
+            self.core_gamma = None
+            self.core_sign = None
 
         ##### generate static obstacles with random position and size
         if num_obs > 0:
@@ -239,94 +241,244 @@ class MarineNavEnv3(gym.Env):
         return penalty
 
     def step(self, actions, is_continuous_action=True):
-
-        rewards = [0]*len(self.robots)
+        # Vectorized robot × substep integration with NumPy broadcasting
+        R = len(self.robots)
+        rewards = [0] * R
 
         assert len(actions) == len(self.robots), "Number of actions not equal number of robots!"
         assert self.check_all_reach_goal() is not True, "All robots reach goals, not actions are available!"
-        # Execute actions for all robots
-        for i,action in enumerate(actions):
-            rob = self.robots[i]
 
-            if rob.deactivated:
-                # This robot is in the deactivate state
+        if R == 0:
+            observations, collisions, reach_goals = self.get_observations()
+            return observations, [], [], []
+
+        active_mask = np.array([not rob.deactivated for rob in self.robots], dtype=bool)
+
+        x = np.array([rob.x for rob in self.robots], dtype=float)
+        y = np.array([rob.y for rob in self.robots], dtype=float)
+        theta = np.array([rob.theta for rob in self.robots], dtype=float)
+        vel_r_world = np.stack([rob.velocity_r for rob in self.robots], axis=0).astype(float)
+        vel_world = vel_r_world.copy()
+
+        left_thrust = np.array([rob.left_thrust for rob in self.robots], dtype=float)
+        right_thrust = np.array([rob.right_thrust for rob in self.robots], dtype=float)
+        left_pos = np.array([rob.left_pos for rob in self.robots], dtype=float)
+        right_pos = np.array([rob.right_pos for rob in self.robots], dtype=float)
+
+        dt = np.array([rob.dt for rob in self.robots], dtype=float)
+        N_vec = np.array([rob.N for rob in self.robots], dtype=int)
+        length = np.array([rob.length for rob in self.robots], dtype=float)
+        width = np.array([rob.width for rob in self.robots], dtype=float)
+        goals = np.stack([rob.goal for rob in self.robots], axis=0).astype(float)
+
+        min_thrust = np.array([rob.min_thrust for rob in self.robots], dtype=float)
+        max_thrust = np.array([rob.max_thrust for rob in self.robots], dtype=float)
+        m_arr = np.array([rob.m for rob in self.robots], dtype=float)
+
+        xDotU = np.array([rob.xDotU for rob in self.robots], dtype=float)
+        yDotV = np.array([rob.yDotV for rob in self.robots], dtype=float)
+        yDotR = np.array([rob.yDotR for rob in self.robots], dtype=float)
+        xU = np.array([rob.xU for rob in self.robots], dtype=float)
+        xUU = np.array([rob.xUU for rob in self.robots], dtype=float)
+        yV = np.array([rob.yV for rob in self.robots], dtype=float)
+        yVV = np.array([rob.yVV for rob in self.robots], dtype=float)
+        yR = np.array([rob.yR for rob in self.robots], dtype=float)
+        yRV = np.array([rob.yRV for rob in self.robots], dtype=float)
+        yVR = np.array([rob.yVR for rob in self.robots], dtype=float)
+        yRR = np.array([rob.yRR for rob in self.robots], dtype=float)
+        nV = np.array([rob.nV for rob in self.robots], dtype=float)
+        nR = np.array([rob.nR for rob in self.robots], dtype=float)
+        nVV = np.array([rob.nVV for rob in self.robots], dtype=float)
+        nRV = np.array([rob.nRV for rob in self.robots], dtype=float)
+        nVR = np.array([rob.nVR for rob in self.robots], dtype=float)
+        nRR = np.array([rob.nRR for rob in self.robots], dtype=float)
+
+        A_stack = np.stack([rob.A_const for rob in self.robots], axis=0).astype(float)
+        D_stack = np.stack([rob.D for rob in self.robots], axis=0).astype(float)
+
+        dis_before = np.sqrt((goals[:, 0] - x) ** 2 + (goals[:, 1] - y) ** 2)
+
+        def _is_pairlike(a):
+            try:
+                return (a is not None) and (np.size(a) == 2) and not isinstance(a, (str, bytes))
+            except Exception:
+                return False
+
+        l_change = np.zeros(R, dtype=float)
+        r_change = np.zeros(R, dtype=float)
+        if bool(is_continuous_action):
+            for i, a in enumerate(actions):
+                if not active_mask[i] or a is None:
+                    continue
+                if _is_pairlike(a):
+                    ai = np.asarray(a, dtype=float).reshape(-1)
+                    l_change[i] = ai[0] * 1000.0
+                    r_change[i] = ai[1] * 1000.0
+                else:
+                    idx = int(np.asarray(a).reshape(-1)[0])
+                    l_change[i], r_change[i] = self.robots[i].actions[idx]
+        else:
+            for i, a in enumerate(actions):
+                if not active_mask[i] or a is None:
+                    continue
+                idx = int(np.asarray(a).reshape(-1)[0])
+                l_change[i], r_change[i] = self.robots[i].actions[idx]
+
+        max_N = int(N_vec.max()) if R > 0 else 0
+        two_pi = 2.0 * np.pi
+
+        for k in range(max_N):
+            sub_mask = active_mask & (N_vec > k)
+            if not np.any(sub_mask):
                 continue
 
-            dis_before = rob.dist_to_goal()
+            idxs = [i for i, v in enumerate(sub_mask) if v]
 
-            # update robot state after executing the action    
-            for idx in range(rob.N):
-                current_velocity = self.get_velocity(rob.x, rob.y)
-                is_new_action = True if idx == 0 else False
-                rob.update_state(action,current_velocity,is_new_action,is_continuous_action)
-            
+            if k == 0:
+                left_thrust[idxs] = np.clip(
+                    left_thrust[idxs] + l_change[idxs] * dt[idxs] * N_vec[idxs],
+                    min_thrust[idxs],
+                    max_thrust[idxs],
+                )
+                right_thrust[idxs] = np.clip(
+                    right_thrust[idxs] + r_change[idxs] * dt[idxs] * N_vec[idxs],
+                    min_thrust[idxs],
+                    max_thrust[idxs],
+                )
+
+            current_v = np.zeros((R, 3), dtype=float)
+            current_v[idxs] = np.array([self.get_velocity(xi, yi) for xi, yi in zip(x[idxs], y[idxs])], dtype=float)
+
+            vel_world_s = vel_r_world[idxs] + current_v[idxs]
+            vel_world[idxs] = vel_world_s
+
+            x[idxs] = x[idxs] + vel_world_s[:, 0] * dt[idxs]
+            y[idxs] = y[idxs] + vel_world_s[:, 1] * dt[idxs]
+            theta[idxs] = (theta[idxs] + vel_world_s[:, 2] * dt[idxs]) % two_pi
+
+            cos_t = np.cos(theta[idxs])
+            sin_t = np.sin(theta[idxs])
+            R_wr_s = np.empty((len(idxs), 2, 2), dtype=float)
+            R_wr_s[:, 0, 0] = cos_t
+            R_wr_s[:, 0, 1] = -sin_t
+            R_wr_s[:, 1, 0] = sin_t
+            R_wr_s[:, 1, 1] = cos_t
+            R_rw_s = np.swapaxes(R_wr_s, 1, 2)
+
+            v_r_b_2 = np.einsum('rij,rj->ri', R_rw_s, vel_r_world[idxs, :2])
+            v_b_2 = np.einsum('rij,rj->ri', R_rw_s, vel_world_s[:, :2])
+            u_r = v_r_b_2[:, 0]
+            v_r_comp = v_r_b_2[:, 1]
+            u = v_b_2[:, 0]
+            v = v_b_2[:, 1]
+            r_ang = vel_world_s[:, 2]
+
+            C_RB = np.zeros((len(idxs), 3, 3), dtype=float)
+            C_RB[:, 0, 1] = -m_arr[idxs] * r_ang
+            C_RB[:, 1, 0] = m_arr[idxs] * r_ang
+
+            C_A = np.zeros((len(idxs), 3, 3), dtype=float)
+            C_A[:, 0, 2] = yDotV[idxs] * v_r_comp + yDotR[idxs] * r_ang
+            C_A[:, 1, 2] = -xDotU[idxs] * u_r
+            C_A[:, 2, 0] = -yDotV[idxs] * v_r_comp - yDotR[idxs] * r_ang
+            C_A[:, 2, 1] = xDotU[idxs] * u_r
+
+            abs_u_r = np.abs(u_r)
+            abs_v_r = np.abs(v_r_comp)
+            abs_r = np.abs(r_ang)
+            D_n = np.zeros((len(idxs), 3, 3), dtype=float)
+            D_n[:, 0, 0] = -xUU[idxs] * abs_u_r
+            D_n[:, 1, 1] = -(yVV[idxs] * abs_v_r + yRV[idxs] * abs_r)
+            D_n[:, 1, 2] = -(yVR[idxs] * abs_v_r + yRR[idxs] * abs_r)
+            D_n[:, 2, 1] = -(nVV[idxs] * abs_v_r + nRV[idxs] * abs_r)
+            D_n[:, 2, 2] = -(nVR[idxs] * abs_v_r + nRR[idxs] * abs_r)
+
+            N_mat = C_A + D_stack[idxs] + D_n
+
+            F_x_left = left_thrust[idxs] * np.cos(left_pos[idxs])
+            F_y_left = left_thrust[idxs] * np.sin(left_pos[idxs])
+            F_x_right = right_thrust[idxs] * np.cos(right_pos[idxs])
+            F_y_right = right_thrust[idxs] * np.sin(right_pos[idxs])
+            M_x_left = F_x_left * (width[idxs] * 0.5)
+            M_y_left = -F_y_left * (length[idxs] * 0.5)
+            M_x_right = -F_x_right * (width[idxs] * 0.5)
+            M_y_right = -F_y_right * (length[idxs] * 0.5)
+            F_x = F_x_left + F_x_right
+            F_y = F_y_left + F_y_right
+            M_n = M_x_left + M_y_left + M_x_right + M_y_right
+            tau_p = np.stack([F_x, F_y, M_n], axis=1)
+
+            V_rf = np.stack([u, v, r_ang], axis=1)
+            V_r_rf = np.stack([u_r, v_r_comp, r_ang], axis=1)
+            b = -np.einsum('rij,rj->ri', C_RB, V_rf) - np.einsum('rij,rj->ri', N_mat, V_r_rf) + tau_p
+            # Per-robot solve to preserve numeric path (use Cholesky if available)
+            acc = np.empty_like(b)
+            for j, ridx in enumerate(idxs):
+                L = getattr(self.robots[ridx], "_A_chol", None)
+                if L is not None:
+                    tmp_chol = np.linalg.solve(L, b[j])
+                    acc[j] = np.linalg.solve(L.T, tmp_chol)
+                else:
+                    acc[j] = np.linalg.solve(A_stack[ridx], b[j])
+
+            V_r_rf = V_r_rf + acc * dt[idxs, None]
+            V_r_world_2 = np.einsum('rij,rj->ri', R_wr_s, V_r_rf[:, :2])
+            vel_r_world[idxs] = np.column_stack([V_r_world_2, V_r_rf[:, 2]])
+
+        dis_after = np.sqrt((goals[:, 0] - x) ** 2 + (goals[:, 1] - y) ** 2)
+        rewards_arr = np.zeros(R, dtype=float)
+        rewards_arr[active_mask] += self.timestep_penalty
+        rewards_arr[active_mask] += (dis_before - dis_after)[active_mask]
+        rewards = rewards_arr.tolist()
+
+        for i, rob in enumerate(self.robots):
+            if not active_mask[i]:
+                continue
+            rob.x = float(x[i])
+            rob.y = float(y[i])
+            rob.theta = float(theta[i])
+            rob.left_thrust = float(left_thrust[i])
+            rob.right_thrust = float(right_thrust[i])
+            rob.velocity_r = vel_r_world[i].copy()
+            rob.velocity = vel_world[i].copy()
             if self.is_eval_env:
-                # save action to history
-                rob.action_history.append(action)
-                
-                # save robot state
+                rob.action_history.append(actions[i])
                 rob.trajectory.append([rob.x,rob.y,rob.theta,rob.velocity_r[0],rob.velocity_r[1],rob.velocity_r[2], \
                                       rob.velocity[0],rob.velocity[1],rob.velocity[2],rob.left_pos,rob.right_pos, \
                                       rob.left_thrust,rob.right_thrust])
 
-            dis_after = rob.dist_to_goal()
-
-            # constant penalty applied at every time step
-            rewards[i] += self.timestep_penalty
-
-            # reward agent for getting closer to the goal
-            rewards[i] += dis_before - dis_after
-
-            # penalize agent for having large angular speed
-            # rewards[i] += self.compute_angular_penalty(rob)
-
-            # reward agent for moving facing forward
-            # steering_reward = self.compute_steering_reward(rob)
-            # rewards[i] += steering_reward    
-        
-
-        # Get observation for all robots
         observations, collisions, reach_goals = self.get_observations()
 
-        dones = [False]*len(self.robots)
-        infos = [{"state":"normal"}]*len(self.robots)
-        
-        # end_episode = False
-        for idx,rob in enumerate(self.robots):
+        dones = [False] * len(self.robots)
+        infos = [{"state": "normal"}] * len(self.robots)
+
+        for idx, rob in enumerate(self.robots):
             if rob.deactivated:
-                # This robot is in the deactivate state
                 dones[idx] = True
                 if rob.collision:
-                    infos[idx] = {"state":"deactivated after collision"}
+                    infos[idx] = {"state": "deactivated after collision"}
                 elif rob.reach_goal:
-                    infos[idx] = {"state":"deactivated after reaching goal"}
+                    infos[idx] = {"state": "deactivated after reaching goal"}
                 else:
                     raise RuntimeError("Robot being deactived can only be caused by collsion or reaching goal!")
                 continue
-            
-            # penalize agent for getting close to other objects
-            # rewards[idx] += self.compute_danger_penalty(rob)
 
-            # penalize agent for not following COLREGs
             rewards[idx] += self.compute_COLREGs_penalty(rob)
 
             if self.episode_timesteps >= 1000:
-                # end_episode = True
                 dones[idx] = True
-                infos[idx] = {"state":"too long episode"}
+                infos[idx] = {"state": "too long episode"}
             elif collisions[idx]:
                 rewards[idx] += self.collision_penalty
-                # end_episode = True
                 dones[idx] = True
-                infos[idx] = {"state":"collision"}
+                infos[idx] = {"state": "collision"}
             elif reach_goals[idx]:
-                # if steer_well:
                 rewards[idx] += self.goal_reward
                 dones[idx] = True
-                infos[idx] = {"state":"reach goal"}
+                infos[idx] = {"state": "reach goal"}
             else:
                 dones[idx] = False
-                infos[idx] = {"state":"normal"}
+                infos[idx] = {"state": "normal"}
 
         self.episode_timesteps += 1
         self.total_timesteps += 1

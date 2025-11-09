@@ -1,6 +1,5 @@
 import numpy as np
 import copy
-import heapq
 
 class Perception:
 
@@ -142,6 +141,7 @@ class Robot:
         self.observation_history = [] # history of noisy observations in one episode
         self.action_history = [] # history of action commands in one episode
         self.trajectory = [] # trajectory in one episode 
+        self.apply_COLREGs = False
 
     def compute_actions(self):
         self.actions = [(l,r) for l in self.left_thrust_change for r in self.right_thrust_change]
@@ -150,13 +150,27 @@ class Robot:
         return len(self.actions)
     
     def compute_constant_matrices(self):
-        self.M_RB = np.matrix([[self.m,0.0,0.0],[0.0,self.m,0.0],[0.0,0.0,self.Izz]])
+        self.M_RB = np.array([[self.m, 0.0, 0.0],
+                              [0.0, self.m, 0.0],
+                              [0.0, 0.0, self.Izz]], dtype=float)
 
-        self.M_A = -1.0 * np.matrix([[self.xDotU,0.0,0.0],[0.0,self.yDotV,self.yDotR],
-                                     [0.0,self.nDotV,self.nDotR]])
-        
-        self.D = -1.0 * np.matrix([[self.xU,0.0,0.0],[0.0,self.yV,self.yR],
-                                   [0.0,self.nV,self.nR]])
+        self.M_A = -1.0 * np.array([[self.xDotU, 0.0, 0.0],
+                                    [0.0, self.yDotV, self.yDotR],
+                                    [0.0, self.nDotV, self.nDotR]], dtype=float)
+
+        self.D = -1.0 * np.array([[self.xU, 0.0, 0.0],
+                                  [0.0, self.yV, self.yR],
+                                  [0.0, self.nV, self.nR]], dtype=float)
+
+        # Precompute constant system matrix A = M_RB + M_A
+        self.A_const = self.M_RB + self.M_A
+
+        # Precompute factorization (Cholesky) for stable solves; fallback if not SPD
+        try:
+            self._A_chol = np.linalg.cholesky(self.A_const)
+        except np.linalg.LinAlgError:
+            self._A_chol = None
+        self._A_T = self.A_const.T
 
     def compute_step_energy_cost(self):
         # TODO: Revise energy computation
@@ -193,9 +207,10 @@ class Robot:
                                 self.left_thrust,self.right_thrust])
 
     def get_robot_transform(self):
-        # compute transformation from world frame to robot frame
-        R_wr = np.matrix([[np.cos(self.theta),-np.sin(self.theta)],[np.sin(self.theta),np.cos(self.theta)]])
-        t_wr = np.matrix([[self.x],[self.y]])
+        # compute rotation (robot -> world) and translation in world frame using ndarrays
+        R_wr = np.array([[np.cos(self.theta), -np.sin(self.theta)],
+                         [np.sin(self.theta),  np.cos(self.theta)]], dtype=float)
+        t_wr = np.array([self.x, self.y], dtype=float)
         return R_wr, t_wr
 
     def update_velocity(self,current_velocity=np.zeros(3)):
@@ -234,49 +249,59 @@ class Robot:
         # use 3 DOF ship maneuvering model from chapter 6.5 in Fossen's book
         velocity_r_b = self.project_to_robot_frame(self.velocity_r[:2])
         velocity_b = self.project_to_robot_frame(self.velocity[:2])
-        u_r = velocity_r_b[0]
-        v_r = velocity_r_b[1]
-        u = velocity_b[0]
-        v = velocity_b[1]
-        r = self.velocity[2]
-        C_RB = np.matrix([[0.0,-self.m*r,0.0],[self.m*r,0.0,0.0],[0.0,0.0,0.0]])
-        C_A = np.matrix([[0.0,0.0,self.yDotV*v_r+self.yDotR*r],[0.0,0.0,-self.xDotU*u_r],
-                         [-self.yDotV*v_r-self.yDotR*r,self.xDotU*u_r,0.0]])
-        D_n = -1.0 * np.matrix([[self.xUU*np.abs(u_r),0.0,0.0],
-                                [0.0,self.yVV*np.abs(v_r)+self.yRV*np.abs(r),self.yVR*np.abs(v_r)+self.yRR*np.abs(r)],
-                                [0.0,self.nVV*np.abs(v_r)+self.nRV*np.abs(r),self.nVR*np.abs(v_r)+self.nRR*np.abs(r)]])
+
+        u_r = float(velocity_r_b[0])
+        v_r = float(velocity_r_b[1])
+        u = float(velocity_b[0])
+        v = float(velocity_b[1])
+        r = float(self.velocity[2])
+
+        C_RB = np.array([[0.0, -self.m * r, 0.0],
+                         [self.m * r,  0.0,  0.0],
+                         [0.0,         0.0,  0.0]], dtype=float)
+        C_A = np.array([[0.0, 0.0, self.yDotV * v_r + self.yDotR * r],
+                        [0.0, 0.0, -self.xDotU * u_r],
+                        [-self.yDotV * v_r - self.yDotR * r, self.xDotU * u_r, 0.0]], dtype=float)
+        D_n = -1.0 * np.array([[self.xUU * np.abs(u_r), 0.0, 0.0],
+                               [0.0, self.yVV * np.abs(v_r) + self.yRV * np.abs(r), self.yVR * np.abs(v_r) + self.yRR * np.abs(r)],
+                               [0.0, self.nVV * np.abs(v_r) + self.nRV * np.abs(r), self.nVR * np.abs(v_r) + self.nRR * np.abs(r)]], dtype=float)
         N = C_A + self.D + D_n
 
         # compute propulsion forces and moment
         F_x_left = self.left_thrust * np.cos(self.left_pos)
         F_y_left = self.left_thrust * np.sin(self.left_pos)
-        M_x_left = F_x_left * self.width/2
-        M_y_left = -F_y_left * self.length/2
-        
+        M_x_left = F_x_left * self.width / 2
+        M_y_left = -F_y_left * self.length / 2
+
         F_x_right = self.right_thrust * np.cos(self.right_pos)
         F_y_right = self.right_thrust * np.sin(self.right_pos)
-        M_x_right = -F_x_right * self.width/2
-        M_y_right = -F_y_right * self.length/2
-        
+        M_x_right = -F_x_right * self.width / 2
+        M_y_right = -F_y_right * self.length / 2
+
         F_x = F_x_left + F_x_right
         F_y = F_y_left + F_y_right
         M_n = M_x_left + M_y_left + M_x_right + M_y_right
-        tau_p = np.matrix([[F_x],[F_y],[M_n]])
+        tau_p = np.array([F_x, F_y, M_n], dtype=float)
 
-        # compute accelerations
-        A = self.M_RB + self.M_A
-        V = np.matrix([[u,v,r]]).transpose()
-        V_r = np.matrix([[u_r,v_r,r]]).transpose()
-        b = -C_RB*V - N*V_r + tau_p
-        acc = np.linalg.inv(A.transpose()*A)*A.transpose()*b
+        # compute accelerations (stable solve with precomputed A_const)
+        A = self.A_const
+        V = np.array([u, v, r], dtype=float)
+        V_r = np.array([u_r, v_r, r], dtype=float)
+        b = -C_RB @ V - N @ V_r + tau_p
+
+        if getattr(self, "_A_chol", None) is not None:
+            y = np.linalg.solve(self._A_chol, b)
+            acc = np.linalg.solve(self._A_chol.T, y)
+        else:
+            acc = np.linalg.solve(A, b)
 
         # apply accelerations to velocity
-        V_r += acc * self.dt
-        
+        V_r = V_r + acc * self.dt
+
         # project velocity to the world frame
-        R_wr,_ = self.get_robot_transform()
-        V_r[:2,:] = R_wr * V_r[:2,:]
-        self.velocity_r = np.squeeze(np.array(V_r))
+        R_wr, _ = self.get_robot_transform()
+        V_r[:2] = R_wr @ V_r[:2]
+        self.velocity_r = V_r
 
     def check_collision(self,obj_x,obj_y,obj_r):
         d = self.compute_distance(obj_x,obj_y,obj_r)
@@ -303,41 +328,35 @@ class Robot:
         return True
 
     def project_to_robot_frame(self,x,is_vector=True):
-        assert isinstance(x,np.ndarray), "the input needs to be an numpy array"
-        assert np.shape(x) == (2,)
-
-        x_r = np.reshape(x,(2,1))
+        assert isinstance(x, np.ndarray), "the input needs to be an numpy array"
+        assert x.shape == (2,)
 
         R_wr, t_wr = self.get_robot_transform()
-
-        R_rw = np.transpose(R_wr)
-        t_rw = -R_rw * t_wr 
+        R_rw = R_wr.T
+        t_rw = -R_rw @ t_wr
 
         if is_vector:
-            x_r = R_rw * x_r
+            x_r = R_rw @ x
         else:
-            x_r = R_rw * x_r + t_rw
+            x_r = R_rw @ x + t_rw
 
-        x_r.resize((2,))
-        return np.array(x_r)
+        return x_r
     
     def project_ego_to_vehicle_frame(self,vehicle):
-        vehicle_p = np.array(vehicle[:2])
-        vehicle_v = np.array(vehicle[2:4])
+        vehicle_p = np.array(vehicle[:2], dtype=float)
+        vehicle_v = np.array(vehicle[2:4], dtype=float)
 
-        vehicle_v_angle = np.arctan2(vehicle_v[1],vehicle_v[0])
-        R = np.matrix([[np.cos(vehicle_v_angle),-np.sin(vehicle_v_angle)], \
-                       [np.sin(vehicle_v_angle),np.cos(vehicle_v_angle)]])
-        t = np.matrix([[vehicle_p[0]],[vehicle_p[1]]])
+        vehicle_v_angle = np.arctan2(vehicle_v[1], vehicle_v[0])
+        R = np.array([[np.cos(vehicle_v_angle), -np.sin(vehicle_v_angle)],
+                      [np.sin(vehicle_v_angle),  np.cos(vehicle_v_angle)]], dtype=float)
+        t = vehicle_p
 
         # project ego position to vehicle_frame
-        ego_p_proj = -np.transpose(R) * t
-        ego_p_proj.resize((2,))
+        ego_p_proj = -(R.T @ t)
 
         # project ego velocity to vehicle_frame
         ego_v = self.project_to_robot_frame(self.velocity[:2])
-        ego_v_proj = np.transpose(R) * np.matrix([[ego_v[0]],[ego_v[1]]])
-        ego_v_proj.resize((2,))
+        ego_v_proj = R.T @ ego_v
 
         return np.array(ego_p_proj), np.array(ego_v_proj)
     
@@ -434,6 +453,7 @@ class Robot:
         return angle
 
     def perception_output(self,obstacles,robots,in_robot_frame=True):
+        self.apply_COLREGs = False
         if self.deactivated:
             return (None,None), self.collision, self.reach_goal
         
@@ -441,12 +461,8 @@ class Robot:
 
         ##### self observation #####
         if in_robot_frame:
-            # vehicle velocity wrt seafloor in self frame
             abs_velocity_r = self.project_to_robot_frame(self.velocity[:2])
-
-            # goal position in self frame
             goal_r = self.project_to_robot_frame(self.goal,False)
-
             self.perception.observation["self"] = list(np.concatenate((goal_r,abs_velocity_r)))
             self.perception.observation["self"].append(self.velocity[2])
             self.perception.observation["self"].append(self.left_thrust)
@@ -455,75 +471,135 @@ class Robot:
             self.perception.observation["self"] = [self.x,self.y,self.velocity[0],self.velocity[1],self.velocity[2], \
                                                    self.left_thrust,self.right_thrust,self.goal[0],self.goal[1]]
 
-
         self.perception.observed_obs.clear()
         self.perception.observed_objs.clear()
-
         self.check_reach_goal()
 
-        ##### static objects #####
-        for i,obs in enumerate(obstacles):            
-            obs_px, obs_py = self.perception.pos_observation(obs.x,obs.y)
-            obs_vx, obs_vy = self.perception.vel_observation(0.0,0.0)
-            obs_r = self.perception.r_observation(obs.r)
-
-            if not self.check_detection(obs_px,obs_py,obs_r):
-                continue
-
-            self.perception.observed_obs.append(i)
-
-            if not self.collision:
-                self.check_collision(obs.x,obs.y,obs.r)
-
-            if in_robot_frame:
-                pos_r = self.project_to_robot_frame(np.array([obs_px,obs_py]),False)
-                vel_r = self.project_to_robot_frame(np.array([obs_vx,obs_vy]))
-                self.perception.observation["objects"].append([pos_r[0],pos_r[1],vel_r[0],vel_r[1],obs_r])
-            else:
-                self.perception.observation["objects"].append([obs_px,obs_py,obs_vx,obs_vy,obs_r])
-
-        ##### robots #####
-        for j,robot in enumerate(robots):
-            if robot is self:
-                continue
-            if robot.deactivated:
-                # This robot is in the deactivate state, and abscent from the current map
-                continue
-            
-            rob_px, rob_py = self.perception.pos_observation(robot.x,robot.y)
-            rob_vx, rob_vy = self.perception.vel_observation(robot.velocity[0],robot.velocity[1])
-            rob_r = self.perception.r_observation(robot.r)
-            
-            if not self.check_detection(rob_px,rob_py,rob_r):
-                continue
-
-            self.perception.observed_objs.append(j)
-            
-            if not self.collision:
-                self.check_collision(robot.x,robot.y,robot.r)
-
-            if in_robot_frame:
-                pos_r = self.project_to_robot_frame(np.array([rob_px,rob_py]),False)
-                vel_r = self.project_to_robot_frame(np.array([rob_vx,rob_vy]))
-                self.perception.observation["objects"].append([pos_r[0],pos_r[1],vel_r[0],vel_r[1],rob_r])
-            else:
-                self.perception.observation["objects"].append([rob_px,rob_py,rob_vx,rob_vy,rob_r])
-
-        self_state = copy.deepcopy(self.perception.observation["self"])
-        object_observations = copy.deepcopy(heapq.nsmallest(self.perception.max_obj_num,
-                                            self.perception.observation["objects"],
-                                            key=lambda obj:self.compute_distance(obj[0],obj[1],obj[4],True)))
-
+        # Count active objects
+        active_robot_indices = [j for j, r in enumerate(robots) if r is not self and not r.deactivated]
+        n_obstacles = len(obstacles)
+        n_robots = len(active_robot_indices)
+        n_objects = n_obstacles + n_robots
+        
+        if n_objects == 0:
+            return (copy.deepcopy(self.perception.observation["self"]), []), self.collision, self.reach_goal
+        
+        # Preallocate arrays for all objects
+        obj_positions = np.zeros((n_objects, 2), dtype=float)
+        obj_velocities = np.zeros((n_objects, 2), dtype=float)
+        obj_radii = np.zeros(n_objects, dtype=float)
+        obj_types = np.zeros(n_objects, dtype=int)  # 0=obstacle, 1=robot
+        obj_indices = np.zeros(n_objects, dtype=int)
+        
+        # Gather obstacle data
+        idx = 0
+        for i, obs in enumerate(obstacles):
+            obj_positions[idx] = [obs.x, obs.y]
+            obj_velocities[idx] = [0.0, 0.0]
+            obj_radii[idx] = obs.r
+            obj_types[idx] = 0
+            obj_indices[idx] = i
+            idx += 1
+        
+        # Gather robot data
+        for j_idx in active_robot_indices:
+            robot = robots[j_idx]
+            obj_positions[idx] = [robot.x, robot.y]
+            obj_velocities[idx] = [robot.velocity[0], robot.velocity[1]]
+            obj_radii[idx] = robot.r
+            obj_types[idx] = 1
+            obj_indices[idx] = j_idx
+            idx += 1
+        
+        # Vectorized noise generation
+        pos_noise = self.perception.rd.normal(0, self.perception.pos_std, size=(n_objects, 2))
+        vel_noise = self.perception.rd.normal(0, self.perception.vel_std, size=(n_objects, 2))
+        r_noise_angles = self.perception.rd.vonmises(0, self.perception.r_kappa, size=n_objects)
+        r_noise = (1 - self.perception.r_mean_ratio) * (r_noise_angles / np.pi) * obj_radii
+        
+        # Apply noise
+        noisy_positions = obj_positions + pos_noise
+        noisy_velocities = obj_velocities + vel_noise
+        noisy_radii = self.perception.r_mean_ratio * obj_radii + r_noise
+        
+        # Get robot transform
+        R_wr, t_wr = self.get_robot_transform()
+        R_rw = R_wr.T
+        t_rw = -R_rw @ t_wr
+        
+        # Transform noisy positions to robot frame for detection
+        noisy_pos_robot = (R_rw @ noisy_positions.T).T + t_rw
+        
+        # Vectorized circular sector detection
+        distances_from_origin = np.linalg.norm(noisy_pos_robot, axis=1)
+        in_range = distances_from_origin <= (self.perception.range + noisy_radii)
+        
+        angles_robot = np.arctan2(noisy_pos_robot[:, 1], noisy_pos_robot[:, 0])
+        half_fov = 0.5 * self.perception.angle
+        in_fov = (angles_robot >= -half_fov) & (angles_robot <= half_fov)
+        
+        detected = in_range & in_fov
+        
+        # Update observed lists
+        obstacle_mask = (obj_types == 0) & detected
+        robot_mask = (obj_types == 1) & detected
+        self.perception.observed_obs = obj_indices[obstacle_mask].astype(int).tolist()
+        self.perception.observed_objs = obj_indices[robot_mask].astype(int).tolist()
+        
+        # Vectorized collision check (using true positions)
+        if not self.collision:
+            collision_distances = np.sqrt((obj_positions[:, 0] - self.x)**2 + 
+                                         (obj_positions[:, 1] - self.y)**2) - obj_radii - self.r
+            if np.any(collision_distances <= 0.0):
+                self.collision = True
+        
+        # Select k-nearest detected objects
+        detected_indices = np.where(detected)[0]
+        n_detected = len(detected_indices)
+        
+        if n_detected == 0:
+            return (copy.deepcopy(self.perception.observation["self"]), []), self.collision, self.reach_goal
+        
+        # Compute distances for k-nearest selection using np.argpartition
+        distances_for_sorting = np.linalg.norm(noisy_pos_robot[detected_indices], axis=1) - \
+                               noisy_radii[detected_indices] - self.r
+        
+        k = min(self.perception.max_obj_num, n_detected)
+        if k < n_detected:
+            partition_indices = np.argpartition(distances_for_sorting, k-1)[:k]
+        else:
+            partition_indices = np.arange(n_detected)
+        
+        # Build object observations
+        object_observations = []
+        if in_robot_frame:
+            noisy_vel_robot = (R_rw @ noisy_velocities.T).T
+            for idx in partition_indices:
+                global_idx = detected_indices[idx]
+                obj_obs = [
+                    noisy_pos_robot[global_idx, 0],
+                    noisy_pos_robot[global_idx, 1],
+                    noisy_vel_robot[global_idx, 0],
+                    noisy_vel_robot[global_idx, 1],
+                    noisy_radii[global_idx]
+                ]
+                object_observations.append(obj_obs)
+        else:
+            for idx in partition_indices:
+                global_idx = detected_indices[idx]
+                obj_obs = [
+                    noisy_positions[global_idx, 0],
+                    noisy_positions[global_idx, 1],
+                    noisy_velocities[global_idx, 0],
+                    noisy_velocities[global_idx, 1],
+                    noisy_radii[global_idx]
+                ]
+                object_observations.append(obj_obs)
+        
         self.apply_COLREGs = False
         for obj in object_observations:
             if self.check_apply_COLREGs(obj):
                 self.apply_COLREGs = True
                 break
-
-        # object_states = []
-        # for object in object_observations:
-        #     object_states += object
-        # object_states += [0.0,0.0,0.0]*(self.perception.max_obj_num-len(object_observations))
-
-        # return self_state+object_states, self.collision, self.reach_goal
-        return (self_state,object_observations), self.collision, self.reach_goal       
+        
+        return (copy.deepcopy(self.perception.observation["self"]), object_observations), self.collision, self.reach_goal       
