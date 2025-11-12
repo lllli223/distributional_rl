@@ -1,1 +1,2 @@
 from marinenav_env.envs.marinenav_env import MarineNavEnv3 
+from marinenav_env.envs.torch_marinenav_env import TorchMarineNavEnv

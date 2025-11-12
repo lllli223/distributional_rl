@@ -161,16 +161,12 @@ class Robot:
         self.D = -1.0 * np.array([[self.xU, 0.0, 0.0],
                                   [0.0, self.yV, self.yR],
                                   [0.0, self.nV, self.nR]], dtype=float)
-
-        # Precompute constant system matrix A = M_RB + M_A
+        
         self.A_const = self.M_RB + self.M_A
-
-        # Precompute factorization (Cholesky) for stable solves; fallback if not SPD
         try:
             self._A_chol = np.linalg.cholesky(self.A_const)
         except np.linalg.LinAlgError:
             self._A_chol = None
-        self._A_T = self.A_const.T
 
     def compute_step_energy_cost(self):
         # TODO: Revise energy computation
@@ -283,17 +279,13 @@ class Robot:
         M_n = M_x_left + M_y_left + M_x_right + M_y_right
         tau_p = np.array([F_x, F_y, M_n], dtype=float)
 
-        # compute accelerations (stable solve with precomputed A_const)
-        A = self.A_const
+        # compute accelerations (use same formula as original)
+        A = self.M_RB + self.M_A
         V = np.array([u, v, r], dtype=float)
         V_r = np.array([u_r, v_r, r], dtype=float)
         b = -C_RB @ V - N @ V_r + tau_p
-
-        if getattr(self, "_A_chol", None) is not None:
-            y = np.linalg.solve(self._A_chol, b)
-            acc = np.linalg.solve(self._A_chol.T, y)
-        else:
-            acc = np.linalg.solve(A, b)
+        
+        acc = np.linalg.inv(A.T @ A) @ A.T @ b
 
         # apply accelerations to velocity
         V_r = V_r + acc * self.dt

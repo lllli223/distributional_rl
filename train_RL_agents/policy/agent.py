@@ -6,7 +6,7 @@ from policy.DDPG_model import DDPG_Policy
 from policy.DQN_model import DQN_Policy
 from policy.Rainbow_model import Rainbow_Policy
 from policy.SAC_model import SAC_Policy
-from policy.replay_buffer import ReplayBuffer
+from policy.replay_buffer import ReplayBuffer, TensorReplayBuffer
 from policy.replay_memory_rainbow import ReplayMemory
 from marinenav_env.envs.utils.robot import Robot
 import numpy as np
@@ -202,7 +202,13 @@ class Agent():
             if agent_type == "Rainbow":
                 self.memory = ReplayMemory(device,BUFFER_SIZE)
             else:
-                self.memory = ReplayBuffer(BUFFER_SIZE,BATCH_SIZE,object_dimension,max_object_num)
+                # 使用TensorReplayBuffer实现GPU原生存储（零CPU-GPU传输）
+                # 根据agent类型确定动作维度
+                if agent_type in ["AC-IQN", "DDPG", "SAC"]:
+                    action_dim = 2  # 连续动作空间
+                else:
+                    action_dim = 1  # 离散动作空间
+                self.memory = TensorReplayBuffer(BUFFER_SIZE,BATCH_SIZE,device=device,action_dim=action_dim)
     
     def act_ac_iqn(self, state, eps=0.0, cvar=1.0, use_eval=True):
         # epsilon-greedy action selection
@@ -323,6 +329,191 @@ class Agent():
 
         return action
 
+    # ========== 批量张量版动作选择（GPU常驻）==========
+    def act_batch_tensor_ac_iqn(self, self_obs, obj_obs, obj_mask, eps=0.0, use_eval=True):
+        """
+        批量张量版AC-IQN动作选择
+        输入：
+          - self_obs: [B,R,7] 张量
+          - obj_obs: [B,R,K,5] 张量
+          - obj_mask: [B,R,K] 张量
+          - eps: epsilon-greedy参数
+        返回：
+          - actions: [B,R,2] 张量（设备端）
+        """
+        B, R = self_obs.shape[0], self_obs.shape[1]
+        dev = self_obs.device
+        
+        # 展平为 [B*R, ...]
+        self_obs_flat = self_obs.reshape(B * R, -1)
+        obj_obs_flat = obj_obs.reshape(B * R, obj_obs.shape[2], obj_obs.shape[3])
+        obj_mask_flat = obj_mask.reshape(B * R, obj_mask.shape[2])
+        
+        state = (self_obs_flat, obj_obs_flat, obj_mask_flat)
+        
+        if use_eval:
+            self.policy_local.actor.eval()
+        else:
+            self.policy_local.actor.train()
+        
+        with torch.no_grad():
+            actions_flat = self.policy_local.actor(state)  # [B*R, 2]
+        
+        self.policy_local.actor.train()
+        
+        # epsilon-greedy（批量）
+        rand_mask = torch.rand(B * R, device=dev) < eps
+        if rand_mask.any():
+            rand_actions = torch.rand((rand_mask.sum(), 2), device=dev) * 2.0 - 1.0
+            actions_flat[rand_mask] = rand_actions
+        
+        return actions_flat.reshape(B, R, 2)
+    
+    def act_batch_tensor_iqn(self, self_obs, obj_obs, obj_mask, eps=0.0, use_eval=True):
+        """批量张量版IQN动作选择，返回 [B,R] 离散动作索引"""
+        B, R = self_obs.shape[0], self_obs.shape[1]
+        dev = self_obs.device
+        
+        self_obs_flat = self_obs.reshape(B * R, -1)
+        obj_obs_flat = obj_obs.reshape(B * R, obj_obs.shape[2], obj_obs.shape[3])
+        obj_mask_flat = obj_mask.reshape(B * R, obj_mask.shape[2])
+        
+        state = (self_obs_flat, obj_obs_flat, obj_mask_flat)
+        
+        if use_eval:
+            self.policy_local.eval()
+        else:
+            self.policy_local.train()
+        
+        with torch.no_grad():
+            quantiles, _ = self.policy_local(state, self.policy_local.K, 1.0)
+            action_values = quantiles.mean(dim=1)  # [B*R, action_size]
+        
+        self.policy_local.train()
+        
+        # epsilon-greedy
+        rand_mask = torch.rand(B * R, device=dev) < eps
+        actions_flat = action_values.argmax(dim=1)  # [B*R]
+        if rand_mask.any():
+            rand_actions = torch.randint(0, self.action_size, (rand_mask.sum(),), device=dev)
+            actions_flat[rand_mask] = rand_actions
+        
+        return actions_flat.reshape(B, R)
+    
+    def act_batch_tensor_ddpg(self, self_obs, obj_obs, obj_mask, eps=0.0, use_eval=True):
+        """批量张量版DDPG动作选择，返回 [B,R,2]"""
+        B, R = self_obs.shape[0], self_obs.shape[1]
+        dev = self_obs.device
+        
+        self_obs_flat = self_obs.reshape(B * R, -1)
+        obj_obs_flat = obj_obs.reshape(B * R, obj_obs.shape[2], obj_obs.shape[3])
+        obj_mask_flat = obj_mask.reshape(B * R, obj_mask.shape[2])
+        
+        state = (self_obs_flat, obj_obs_flat, obj_mask_flat)
+        
+        if use_eval:
+            self.policy_local.actor.eval()
+        else:
+            self.policy_local.actor.train()
+        
+        with torch.no_grad():
+            actions_flat = self.policy_local.actor(state)
+        
+        self.policy_local.actor.train()
+        
+        rand_mask = torch.rand(B * R, device=dev) < eps
+        if rand_mask.any():
+            rand_actions = torch.rand((rand_mask.sum(), 2), device=dev) * 2.0 - 1.0
+            actions_flat[rand_mask] = rand_actions
+        
+        return actions_flat.reshape(B, R, 2)
+    
+    def act_batch_tensor_dqn(self, self_obs, obj_obs, obj_mask, eps=0.0, use_eval=True):
+        """批量张量版DQN动作选择，返回 [B,R]"""
+        B, R = self_obs.shape[0], self_obs.shape[1]
+        dev = self_obs.device
+        
+        self_obs_flat = self_obs.reshape(B * R, -1)
+        obj_obs_flat = obj_obs.reshape(B * R, obj_obs.shape[2], obj_obs.shape[3])
+        obj_mask_flat = obj_mask.reshape(B * R, obj_mask.shape[2])
+        
+        state = (self_obs_flat, obj_obs_flat, obj_mask_flat)
+        
+        if use_eval:
+            self.policy_local.eval()
+        else:
+            self.policy_local.train()
+        
+        with torch.no_grad():
+            action_values = self.policy_local(state)
+        
+        self.policy_local.train()
+        
+        rand_mask = torch.rand(B * R, device=dev) < eps
+        actions_flat = action_values.argmax(dim=1)
+        if rand_mask.any():
+            rand_actions = torch.randint(0, self.action_size, (rand_mask.sum(),), device=dev)
+            actions_flat[rand_mask] = rand_actions
+        
+        return actions_flat.reshape(B, R)
+    
+    def act_batch_tensor_sac(self, self_obs, obj_obs, obj_mask, eps=0.0, use_eval=True):
+        """批量张量版SAC动作选择，返回 [B,R,2]"""
+        B, R = self_obs.shape[0], self_obs.shape[1]
+        dev = self_obs.device
+        
+        self_obs_flat = self_obs.reshape(B * R, -1)
+        obj_obs_flat = obj_obs.reshape(B * R, obj_obs.shape[2], obj_obs.shape[3])
+        obj_mask_flat = obj_mask.reshape(B * R, obj_mask.shape[2])
+        
+        state = (self_obs_flat, obj_obs_flat, obj_mask_flat)
+        
+        if use_eval:
+            self.policy_local.actor.eval()
+        else:
+            self.policy_local.actor.train()
+        
+        with torch.no_grad():
+            actions_flat, _ = self.policy_local.actor(state)
+        
+        self.policy_local.actor.train()
+        
+        rand_mask = torch.rand(B * R, device=dev) < eps
+        if rand_mask.any():
+            rand_actions = torch.rand((rand_mask.sum(), 2), device=dev) * 2.0 - 1.0
+            actions_flat[rand_mask] = rand_actions
+        
+        return actions_flat.reshape(B, R, 2)
+    
+    def act_batch_tensor_rainbow(self, self_obs, obj_obs, obj_mask, eps=0.0, use_eval=True):
+        """批量张量版Rainbow动作选择，返回 [B,R]"""
+        B, R = self_obs.shape[0], self_obs.shape[1]
+        dev = self_obs.device
+        
+        self_obs_flat = self_obs.reshape(B * R, -1)
+        obj_obs_flat = obj_obs.reshape(B * R, obj_obs.shape[2], obj_obs.shape[3])
+        obj_mask_flat = obj_mask.reshape(B * R, obj_mask.shape[2])
+        
+        state = (self_obs_flat, obj_obs_flat, obj_mask_flat)
+        
+        if use_eval:
+            self.policy_local.eval()
+        else:
+            self.policy_local.train()
+        
+        with torch.no_grad():
+            action_value_probs = self.policy_local(state)
+        
+        self.policy_local.train()
+        
+        rand_mask = torch.rand(B * R, device=dev) < eps
+        actions_flat = (action_value_probs * self.support.unsqueeze(0)).sum(2).argmax(1)
+        if rand_mask.any():
+            rand_actions = torch.randint(0, self.action_size, (rand_mask.sum(),), device=dev)
+            actions_flat[rand_mask] = rand_actions
+        
+        return actions_flat.reshape(B, R)
+
     # def act_adaptive_ac_iqn(self, state, eps=0.0):
     #     cvar = self.adjust_cvar(state)
     #     action = self.act_ac_iqn(state,eps,cvar)
@@ -358,14 +549,22 @@ class Agent():
     #     return cvar
         
     def state_to_tensor(self,states):
-        self_state_batch,object_batch,object_batch_mask = states
-        
-        self_state_batch = torch.tensor(self_state_batch).float().to(self.device)
-        empty = (len(object_batch) == 0)
-        object_batch = None if empty else torch.tensor(object_batch).float().to(self.device)
-        object_batch_mask = None if empty else torch.tensor(object_batch_mask).float().to(self.device)
-
-        return (self_state_batch,object_batch,object_batch_mask)
+        self_state_batch, object_batch, object_batch_mask = states
+        if isinstance(self_state_batch, torch.Tensor):
+            self_state_batch_t = self_state_batch.float().to(self.device)
+        else:
+            self_state_batch_t = torch.tensor(self_state_batch).float().to(self.device)
+        if object_batch is None or object_batch_mask is None:
+            return (self_state_batch_t, None, None)
+        if isinstance(object_batch, torch.Tensor):
+            object_batch_t = object_batch.float().to(self.device)
+        else:
+            object_batch_t = torch.tensor(object_batch).float().to(self.device)
+        if isinstance(object_batch_mask, torch.Tensor):
+            object_batch_mask_t = object_batch_mask.float().to(self.device)
+        else:
+            object_batch_mask_t = torch.tensor(object_batch_mask).float().to(self.device)
+        return (self_state_batch_t, object_batch_t, object_batch_mask_t)
 
     def train(self):
         if self.agent_type == "AC-IQN":
@@ -385,11 +584,17 @@ class Agent():
 
     def train_AC_IQN(self):
         states, actions, rewards, next_states, dones = self.memory.sample()
+
+        # 调试信息
+        # print(f"Debug - actions type: {type(actions)}")
+        # print(f"Debug - actions shape: {actions.shape if hasattr(actions, 'shape') else 'No shape'}")
+        # print(f"Debug - actions device: {actions.device if hasattr(actions, 'device') else 'No device'}")
+
         states = self.state_to_tensor(states)
-        actions = torch.tensor(actions).float().to(self.device)
-        rewards = torch.tensor(rewards).unsqueeze(-1).float().to(self.device)
+        actions = actions if isinstance(actions, torch.Tensor) else torch.tensor(actions).float().to(self.device)
+        rewards = rewards.unsqueeze(-1) if isinstance(rewards, torch.Tensor) else torch.tensor(rewards).unsqueeze(-1).float().to(self.device)
         next_states = self.state_to_tensor(next_states)
-        dones = torch.tensor(dones).unsqueeze(-1).float().to(self.device)
+        dones = dones.unsqueeze(-1) if isinstance(dones, torch.Tensor) else torch.tensor(dones).unsqueeze(-1).float().to(self.device)
 
         # update critic network
         self.critic_optimizer.zero_grad()
@@ -398,7 +603,7 @@ class Agent():
         next_actions = next_actions.detach()
         Q_targets_next,_ = self.policy_target.critic(next_states,next_actions)
         Q_targets_next = Q_targets_next.detach().unsqueeze(1)
-        Q_targets = rewards.unsqueeze(-1) + (self.GAMMA * Q_targets_next * (1. - dones.unsqueeze(-1)))
+        Q_targets = rewards.unsqueeze(-1) + (self.GAMMA * Q_targets_next * (~dones.unsqueeze(-1)).float())
 
         Q_expected,taus = self.policy_local.critic(states,actions)
         Q_expected = Q_expected.unsqueeze(-1)
@@ -441,10 +646,10 @@ class Agent():
 
         states, actions, rewards, next_states, dones = self.memory.sample()
         states = self.state_to_tensor(states)
-        actions = torch.tensor(actions).unsqueeze(-1).to(self.device)
-        rewards = torch.tensor(rewards).unsqueeze(-1).float().to(self.device)
+        actions = actions.unsqueeze(-1) if isinstance(actions, torch.Tensor) else torch.tensor(actions).unsqueeze(-1).to(self.device)
+        rewards = rewards.unsqueeze(-1) if isinstance(rewards, torch.Tensor) else torch.tensor(rewards).unsqueeze(-1).float().to(self.device)
         next_states = self.state_to_tensor(next_states)
-        dones = torch.tensor(dones).unsqueeze(-1).float().to(self.device)
+        dones = dones.unsqueeze(-1) if isinstance(dones, torch.Tensor) else torch.tensor(dones).unsqueeze(-1).float().to(self.device)
 
         self.optimizer.zero_grad()
         # Get max predicted Q values (for next states) from target model
@@ -452,7 +657,7 @@ class Agent():
         Q_targets_next = Q_targets_next.detach().max(2)[0].unsqueeze(1) # (batch_size, 1, N)
         
         # Compute Q targets for current states 
-        Q_targets = rewards.unsqueeze(-1) + (self.GAMMA * Q_targets_next * (1. - dones.unsqueeze(-1)))
+        Q_targets = rewards.unsqueeze(-1) + (self.GAMMA * Q_targets_next * (~dones.unsqueeze(-1)).float())
         # Get expected Q values from local model
         Q_expected,taus = self.policy_local(states)
         Q_expected = Q_expected.gather(2, actions.unsqueeze(-1).expand(self.BATCH_SIZE, 8, 1))
@@ -478,10 +683,10 @@ class Agent():
     def train_DDPG(self):
         states, actions, rewards, next_states, dones = self.memory.sample()
         states = self.state_to_tensor(states)
-        actions = torch.tensor(actions).float().to(self.device)
-        rewards = torch.tensor(rewards).unsqueeze(-1).float().to(self.device)
+        actions = actions if isinstance(actions, torch.Tensor) else torch.tensor(actions).float().to(self.device)
+        rewards = rewards.unsqueeze(-1) if isinstance(rewards, torch.Tensor) else torch.tensor(rewards).unsqueeze(-1).float().to(self.device)
         next_states = self.state_to_tensor(next_states)
-        dones = torch.tensor(dones).unsqueeze(-1).float().to(self.device)
+        dones = dones.unsqueeze(-1) if isinstance(dones, torch.Tensor) else torch.tensor(dones).unsqueeze(-1).float().to(self.device)
 
         # update critic network
         self.critic_optimizer.zero_grad()
@@ -489,7 +694,7 @@ class Agent():
         next_actions = next_actions.detach()
         Q_targets_next = self.policy_target.critic(next_states,next_actions)
         Q_targets_next = Q_targets_next.detach()
-        Q_targets = rewards + self.GAMMA * Q_targets_next * (1. - dones)
+        Q_targets = rewards + self.GAMMA * Q_targets_next * (~dones).float()
 
         Q_expected = self.policy_local.critic(states,actions)
 
@@ -518,10 +723,10 @@ class Agent():
     def train_DQN(self):
         states, actions, rewards, next_states, dones = self.memory.sample()
         states = self.state_to_tensor(states)
-        actions = torch.tensor(actions).unsqueeze(-1).to(self.device)
-        rewards = torch.tensor(rewards).unsqueeze(-1).float().to(self.device)
+        actions = actions.unsqueeze(-1) if isinstance(actions, torch.Tensor) else torch.tensor(actions).unsqueeze(-1).to(self.device)
+        rewards = rewards.unsqueeze(-1) if isinstance(rewards, torch.Tensor) else torch.tensor(rewards).unsqueeze(-1).float().to(self.device)
         next_states = self.state_to_tensor(next_states)
-        dones = torch.tensor(dones).unsqueeze(-1).float().to(self.device)
+        dones = dones.unsqueeze(-1) if isinstance(dones, torch.Tensor) else torch.tensor(dones).unsqueeze(-1).float().to(self.device)
 
         self.optimizer.zero_grad()
 
@@ -548,17 +753,17 @@ class Agent():
         ### Based on the function in line 226 of (https://github.com/thu-ml/tianshou/blob/master/tianshou/policy/modelfree/sac.py)
         states, actions, rewards, next_states, dones = self.memory.sample()
         states = self.state_to_tensor(states)
-        actions = torch.tensor(actions).float().to(self.device)
-        rewards = torch.tensor(rewards).unsqueeze(-1).float().to(self.device)
+        actions = actions if isinstance(actions, torch.Tensor) else torch.tensor(actions).float().to(self.device)
+        rewards = rewards.unsqueeze(-1) if isinstance(rewards, torch.Tensor) else torch.tensor(rewards).unsqueeze(-1).float().to(self.device)
         next_states = self.state_to_tensor(next_states)
-        dones = torch.tensor(dones).unsqueeze(-1).float().to(self.device)
+        dones = dones.unsqueeze(-1) if isinstance(dones, torch.Tensor) else torch.tensor(dones).unsqueeze(-1).float().to(self.device)
 
         with torch.no_grad():
             next_actions, next_log_probs = self.policy_target.actor(next_states)
             target_values_1 = self.policy_target.critic_1(next_states,next_actions)
             target_values_2 = self.policy_target.critic_2(next_states,next_actions)
             target_values = torch.min(target_values_1,target_values_2) - self.alpha * next_log_probs
-            target_values = rewards + self.GAMMA * target_values * (1. - dones)
+            target_values = rewards + self.GAMMA * target_values * (~dones).float()
 
         # compute critic losses
         values_1 = self.policy_local.critic_1(states,actions)

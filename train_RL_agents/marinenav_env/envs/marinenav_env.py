@@ -141,14 +141,16 @@ class MarineNavEnv3(gym.Env):
                     break
         
         # Pack core attributes into fixed ndarrays for fast velocity queries
-        if len(self.cores) > 0:
-            self.core_pos = np.array([[core.x, core.y] for core in self.cores], dtype=float)
-            self.core_gamma = np.array([core.Gamma for core in self.cores], dtype=float)
-            self.core_sign = np.array([1.0 if core.clockwise else -1.0 for core in self.cores], dtype=float)
-        else:
-            self.core_pos = None
-            self.core_gamma = None
-            self.core_sign = None
+        centers = None
+        for core in self.cores:
+            if centers is None:
+                centers = np.array([[core.x,core.y]])
+            else:
+                c = np.array([[core.x,core.y]])
+                centers = np.vstack((centers,c))
+        
+        if centers is not None:
+            self.core_centers = scipy.spatial.KDTree(centers)
 
         ##### generate static obstacles with random position and size
         if num_obs > 0:
